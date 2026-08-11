@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script>
+        (function() {
+            try {
+                var theme = localStorage.getItem('solfai_theme');
+                if (theme === 'light') {
+                    document.documentElement.setAttribute('data-theme', 'light');
+                }
+                var color = localStorage.getItem('solfai_color');
+                if (color && color !== 'default') {
+                    document.documentElement.setAttribute('data-color', color);
+                }
+            } catch (e) {}
+        })();
+    </script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Terms of Service — Solf.ai</title>
+    <link rel="icon" type="image/png" sizes="192x192" href="assets/favicon-192.png?v=8">
+    <link rel="icon" href="favicon.ico?v=8" sizes="48x48">
+    <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png?v=8">
+    <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png?v=8">
+    <link rel="manifest" href="manifest.json">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="Solf.ai">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * { font-family: 'Inter', sans-serif; box-sizing: border-box; }
+        :root {
+            --bg-primary: #0a0a0f; --bg-secondary: #13131a; --text-primary: #f1f5f9;
+            --text-secondary: #94a3b8; --purple-soft: #8b5cf6; --purple-glow: #a78bfa;
+            --border-color: rgba(139,92,246,0.2); --hover-accent-bg: rgba(139,92,246,0.1);
+        }
+        [data-theme="light"] {
+            --bg-primary: #f8f7fc; --bg-secondary: #ffffff; --text-primary: #1e1b2e;
+            --text-secondary: #64607a; --purple-soft: #7c3aed; --purple-glow: #8b5cf6;
+            --border-color: rgba(139,92,246,0.2); --hover-accent-bg: rgba(139,92,246,0.1);
+        }
+        [data-color="blue"] {
+            --purple-soft: #3b82f6; --purple-glow: #60a5fa; --border-color: rgba(59,130,246,0.2); --hover-accent-bg: rgba(59,130,246,0.1);
+        }
+        [data-theme="light"][data-color="blue"] {
+            --purple-glow: #2563eb; --border-color: rgba(59,130,246,0.2); --hover-accent-bg: rgba(59,130,246,0.1);
+        }
+        [data-color="green"] {
+            --purple-soft: #10b981; --purple-glow: #34d399; --border-color: rgba(16,185,129,0.2); --hover-accent-bg: rgba(16,185,129,0.1);
+        }
+        [data-theme="light"][data-color="green"] {
+            --purple-glow: #059669; --border-color: rgba(16,185,129,0.2); --hover-accent-bg: rgba(16,185,129,0.1);
+        }
+        [data-color="rose"] {
+            --purple-soft: #f43f5e; --purple-glow: #fb7185; --border-color: rgba(244,63,94,0.2); --hover-accent-bg: rgba(244,63,94,0.1);
+        }
+        [data-theme="light"][data-color="rose"] {
+            --purple-glow: #e11d48; --border-color: rgba(244,63,94,0.2); --hover-accent-bg: rgba(244,63,94,0.1);
+        }
+        [data-theme="light"] body {
+            background: linear-gradient(180deg, #f8f7fc 0%, #f0eef7 100%);
+        }
+        body { background: var(--bg-primary); color: var(--text-primary); min-height: 100vh; margin: 0; padding: 40px 20px; transition: all 0.3s; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 32px; flex-wrap: wrap; gap: 16px; }
+        .back-link { display: inline-flex; align-items: center; gap: 8px; color: var(--purple-soft); text-decoration: none; font-size: 14px; }
+        .back-link:hover { text-decoration: underline; }
+        .lang-selector { display: flex; gap: 8px; flex-wrap: wrap; }
+        .lang-btn { padding: 8px 12px; background: var(--bg-secondary); border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); cursor: pointer; font-size: 14px; transition: all 0.2s; }
+        .lang-btn:hover, .lang-btn.active { border-color: var(--purple-soft); background: var(--hover-accent-bg); }
+        h1 { font-size: 2rem; margin-bottom: 8px; background: linear-gradient(135deg, var(--purple-soft), var(--purple-glow)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+        .date { color: var(--text-secondary); font-size: 14px; margin-bottom: 40px; }
+        h2 { font-size: 1.25rem; margin: 32px 0 16px; color: var(--text-primary); }
+        p, li { font-size: 15px; color: var(--text-secondary); line-height: 1.8; margin-bottom: 16px; }
+        ul { padding-left: 24px; }
+        strong { color: var(--text-primary); }
+        a { color: var(--purple-soft); }
+        .content { display: none; }
+        .content.active { display: block; }
+        .site-contact { margin-top: 48px; padding-top: 24px; border-top: 1px solid var(--border-color); font-size: 14px; color: var(--text-secondary); }
+    </style>
+</head>
+<body class="preload">
+    <div class="container">
+        <div class="header">
+            <a href="index.html" class="back-link" id="backLink">← Back to Solf.ai</a>
+            <div class="lang-selector">
+                <button class="lang-btn active" data-lang="en">EN</button>
+                <button class="lang-btn" data-lang="ru">RU</button>
+            </div>
+        </div>
+
+        <div class="content active" id="content-en">
+            <h1>Terms of Service</h1>
+            <p class="date">Effective date: July 28, 2026 · <a href="privacy.html">Privacy Policy</a></p>
+            <p>By using Solf.ai (the “<strong>Service</strong>”), you agree to these Terms of Service (“<strong>Terms</strong>”) and our <a href="privacy.html">Privacy Policy</a>. If you do not agree, do not use the Service.</p>
+
+            <h2>1. Operator / contact</h2>
+            <p>The Service is Solf.ai. Contact: Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a>.</p>
+
+            <h2>2. Eligibility</h2>
+            <p>You must be at least <strong>13 years old</strong> (or the age of digital consent in your jurisdiction if higher) to use the Service. <strong>Paid plans</strong> are intended for users aged <strong>18+</strong>. If you are under 18, do not purchase a paid plan without a parent or legal guardian.</p>
+
+            <h2>3. Nature of the Service</h2>
+            <p>Solf.ai provides <strong>AI-generated reference information</strong> about music theory, solfège, ear training, and related topics. The Service is <strong>not</strong> a school or university, does <strong>not</strong> issue official diplomas or certificates, and does <strong>not</strong> replace instruction by a qualified teacher. Outputs are produced automatically and are for general information only.</p>
+
+            <h2>4. Accounts and sign-in</h2>
+            <p>Optional sign-in via <strong>Google</strong> or <strong>VK</strong> is subject to those providers’ terms and privacy policies. You are responsible for activity under your account. Sign-in requires accepting these Terms and the Privacy Policy.</p>
+
+            <h2>5. Your messages, images, and API processing</h2>
+            <p>To generate replies, the Service sends your <strong>text messages</strong>, a <strong>limited portion of conversation context</strong>, and any <strong>images</strong> you attach to our backend (API), which may use <strong>Google Gemini</strong>. That processing is essential to provide the Service. Chat history may also be stored <strong>locally in your browser</strong>. Do not submit information you are not allowed to share, or illegal content. Prefer not to paste passwords, full card numbers, or unnecessary personal details into chat.</p>
+
+            <h2>6. AI output and reliance</h2>
+            <p>Outputs may be <strong>incorrect, incomplete, biased, or outdated</strong>. They are <strong>not</strong> professional, medical, legal, tax, or financial advice. You alone decide how to use outputs. We are not responsible for consequences of reliance on AI answers.</p>
+
+            <h2>7. Acceptable use</h2>
+            <p>You must comply with applicable law. Without limitation, you must not: (a) use the Service for unlawful, harmful, harassing, or discriminatory purposes; (b) attempt to probe, scrape, overload, or reverse engineer the Service or bypass limits; (c) upload malware or infringe others’ rights; (d) misuse the Service for spam or deception; (e) use another person’s identity without permission.</p>
+
+            <h2>8. Intellectual property</h2>
+            <p>The Service’s software, branding, and design are protected. You retain rights to prompts you create, subject to these Terms; <strong>AI-generated text may not be copyrightable</strong> in your jurisdiction.</p>
+
+            <h2>9. Plans, payments (YooKassa), and refunds</h2>
+            <p>Paid plans, limits, and prices are described on the <a href="pricing.html">pricing</a> page. Payment is processed via <strong>YooKassa (ЮKassa)</strong>. Available payment methods are those shown in the YooKassa checkout (typically bank cards, including MIR where available).</p>
+            <ul>
+                <li><strong>Activation:</strong> paid access is activated after successful payment confirmation (or after we manually confirm payment if checkout is temporarily unavailable and payment is arranged via support).</li>
+                <li><strong>Period:</strong> access lasts for the paid period shown at checkout / on the pricing page (month or year).</li>
+                <li><strong>Cancel:</strong> you may stop renewing; access continues until the end of the already paid period. There is no obligation to buy again.</li>
+                <li><strong>Refunds:</strong> if the Service was not provided due to our technical fault after payment, contact <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a> — we will review and, where appropriate, refund or extend access. Mandatory consumer rights under applicable law are not limited by this paragraph where they cannot be waived.</li>
+                <li><strong>Support:</strong> payment and access questions — Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a>.</li>
+            </ul>
+
+            <h2>10. Disclaimer of warranties</h2>
+            <p>THE SERVICE IS PROVIDED <strong>“AS IS” AND “AS AVAILABLE”</strong>. TO THE MAXIMUM EXTENT PERMITTED BY LAW, WE DISCLAIM ALL WARRANTIES, WHETHER EXPRESS, IMPLIED, OR STATUTORY, INCLUDING MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.</p>
+
+            <h2>11. Limitation of liability</h2>
+            <p>TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, WE SHALL NOT BE LIABLE FOR ANY INDIRECT, INCIDENTAL, SPECIAL, CONSEQUENTIAL, OR PUNITIVE DAMAGES, OR ANY LOSS OF PROFITS, DATA, GOODWILL, OR BUSINESS. OUR TOTAL LIABILITY FOR ANY CLAIM ARISING OUT OF THESE TERMS OR THE SERVICE SHALL NOT EXCEED THE GREATER OF (A) THE AMOUNTS YOU PAID US FOR THE SERVICE IN THE <strong>12 MONTHS</strong> BEFORE THE CLAIM OR (B) <strong>USD 50</strong> (or equivalent), EXCEPT WHERE LIABILITY CANNOT BE LIMITED UNDER MANDATORY LAW.</p>
+
+            <h2>12. Suspension and termination</h2>
+            <p>We may suspend or terminate access if we reasonably believe you violated these Terms, pose a security risk, or if required by law. You may stop using the Service at any time.</p>
+
+            <h2>13. Changes</h2>
+            <p>We may update these Terms; the new effective date will be posted on this page. Continued use after changes constitutes acceptance. If you do not agree, discontinue use.</p>
+
+            <h2>14. Governing law</h2>
+            <p>These Terms are governed by the <strong>laws of the Russian Federation</strong>, without regard to conflict-of-law principles, <strong>without prejudice to mandatory consumer rights</strong> where you habitually reside if such rights cannot be waived.</p>
+
+            <h2>15. Contact</h2>
+            <p>Solf.ai · Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a> · <a href="privacy.html">Privacy Policy</a></p>
+        </div>
+
+        <div class="content" id="content-ru">
+            <h1>Условия использования</h1>
+            <p class="date">Дата вступления в силу: 28 июля 2026 г. · <a href="privacy.html">Политика конфиденциальности</a></p>
+            <p>Используя Solf.ai («<strong>Сервис</strong>»), вы принимаете настоящие Условия («<strong>Условия</strong>») и <a href="privacy.html">Политику конфиденциальности</a>. Если вы не согласны — не используйте Сервис.</p>
+
+            <h2>1. Оператор / контакт</h2>
+            <p>Сервис — Solf.ai. Связь: Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a>.</p>
+
+            <h2>2. Возраст</h2>
+            <p>Для использования Сервиса вам должно быть не менее <strong>13 лет</strong> (или возраст цифрового согласия в вашей юрисдикции, если он выше). <strong>Платные тарифы</strong> рассчитаны на пользователей <strong>от 18 лет</strong>. Если вам меньше 18 — не оформляйте платную подписку без родителя или законного представителя.</p>
+
+            <h2>3. Характер Сервиса</h2>
+            <p>Solf.ai предоставляет <strong>справочную информацию, сгенерированную ИИ</strong>, по теории музыки, сольфеджио, слуху и смежным темам. Сервис <strong>не</strong> является образовательной организацией, <strong>не</strong> выдаёт государственные дипломы и <strong>не</strong> заменяет занятия с квалифицированным педагогом. Ответы формируются автоматически и носят общий информационный характер.</p>
+
+            <h2>4. Учётная запись и вход</h2>
+            <p>Опциональный вход через <strong>Google</strong> или <strong>VK</strong> регулируется условиями и политиками этих сервисов. Вы несёте ответственность за действия в учётной записи. Для входа необходимо принять настоящие Условия и Политику конфиденциальности.</p>
+
+            <h2>5. Сообщения, изображения и обработка на сервере</h2>
+            <p>Для генерации ответов Сервис передаёт на бэкенд (API) ваши <strong>текстовые сообщения</strong>, <strong>ограниченный контекст переписки</strong> и прикреплённые <strong>изображения</strong>; обработка может выполняться через <strong>Google Gemini</strong>. Без такой обработки предоставление Сервиса невозможно. История чатов может дополнительно храниться <strong>локально в браузере</strong>. Не отправляйте сведения, которые вы не вправе разглашать, и запрещённый контент. Не вставляйте в чат пароли, полные номера карт и лишние персональные данные.</p>
+
+            <h2>6. Ответы ИИ и риски</h2>
+            <p>Результаты могут быть <strong>неточными, неполными, предвзятыми или устаревшими</strong>. Они <strong>не</strong> являются профессиональной, медицинской, юридической, налоговой или иной консультацией. Решения о использовании ответов принимаете вы.</p>
+
+            <h2>7. Допустимое использование</h2>
+            <p>Вы обязуетесь соблюдать закон. Запрещено, в том числе: (a) противоправное, вредоносное, дискриминационное использование; (b) попытки взлома, парсинга, перегрузки, обхода лимитов; (c) загрузка вредоносного ПО, нарушение прав третьих лиц; (d) спам и обман; (e) использование чужой личности без согласия.</p>
+
+            <h2>8. Интеллектуальная собственность</h2>
+            <p>ПО, брендинг и дизайн Сервиса охраняются. Права на ваши запросы сохраняются за вами с учётом Условий; <strong>сгенерированный ИИ текст может не охраняться авторским правом</strong> в вашей юрисдикции.</p>
+
+            <h2>9. Тарифы, оплата (ЮKassa) и возврат</h2>
+            <p>Платные функции и цены описаны на странице <a href="pricing.html">тарифов</a>. Оплата проходит через <strong>ЮKassa</strong>. Доступные способы оплаты — те, что показывает форма ЮKassa (как правило банковские карты, в т.ч. МИР).</p>
+            <ul>
+                <li><strong>Активация:</strong> платный доступ включается после подтверждения успешной оплаты (либо после ручного подтверждения через поддержку, если форма оплаты временно недоступна).</li>
+                <li><strong>Срок:</strong> доступ действует в течение оплаченного периода (месяц или год), указанного при оплате / на странице тарифов.</li>
+                <li><strong>Отмена:</strong> вы можете не продлевать доступ; уже оплаченный период продолжает действовать до его окончания.</li>
+                <li><strong>Возврат:</strong> если после оплаты Сервис не был предоставлен по нашей технической вине — напишите <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a>: разберём и при обоснованности вернём оплату или продлим доступ. Императивные права потребителя, которые нельзя ограничить договором, сохраняются.</li>
+                <li><strong>Поддержка:</strong> вопросы оплаты и доступа — Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a>.</li>
+            </ul>
+
+            <h2>10. Отказ от гарантий</h2>
+            <p>СЕРВИС ПРЕДОСТАВЛЯЕТСЯ <strong>«КАК ЕСТЬ»</strong>. В МАКСИМАЛЬНОЙ СТЕПЕНИ, ДОПУСТИМОЙ ЗАКОНОМ, МЫ ОТКАЗЫВАЕМСЯ ОТ ВСЕХ ГАРАНТИЙ, ЯВНЫХ И ПОДРАЗУМЕВАЕМЫХ.</p>
+
+            <h2>11. Ограничение ответственности</h2>
+            <p>В МАКСИМАЛЬНОЙ СТЕПЕНИ, ДОПУСТИМОЙ ПРИМЕНИМЫМ ПРАВОМ, МЫ НЕ НЕСЁМ ОТВЕТСТВЕННОСТИ ЗА КОСВЕННЫЙ, СЛУЧАЙНЫЙ, ОСОБЫЙ ИЛИ ШТРАФНОЙ УЩЕРБ, УПУЩЕННУЮ ВЫГОДУ ИЛИ ПОТЕРЮ ДАННЫХ. СОВОКУПНАЯ ОТВЕТСТВЕННОСТЬ ОГРАНИЧИВАЕТСЯ БОЛЬШЕЙ ИЗ ВЕЛИЧИН: (A) СУММЫ, УПЛАЧЕННОЙ ВАМИ ЗА СЕРВИС ЗА <strong>12 МЕСЯЦЕВ</strong> ДО ТРЕБОВАНИЯ, ИЛИ (B) <strong>50 ДОЛЛАРАМИ США</strong> (или эквивалентом), ЗА ИСКЛЮЧЕНИЕМ СЛУЧАЕВ, КОГДА ОГРАНИЧЕНИЕ ЗАПРЕЩЕНО ИМПЕРАТИВНЫМ ПРАВОМ.</p>
+
+            <h2>12. Приостановление и прекращение</h2>
+            <p>Мы можем приостановить или прекратить доступ при нарушении Условий, угрозе безопасности или по требованию закона. Вы можете прекратить использование в любой момент.</p>
+
+            <h2>13. Изменения</h2>
+            <p>Мы можем обновлять Условия; новая дата публикуется на этой странице. Продолжение использования после изменений означает согласие.</p>
+
+            <h2>14. Применимое право</h2>
+            <p>Условия регулируются <strong>законодательством Российской Федерации</strong> без учёта коллизионных норм, <strong>без ущерба для императивных прав потребителей</strong>, если такие права не могут быть отменены соглашением.</p>
+
+            <h2>15. Контакты</h2>
+            <p>Solf.ai · Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a> · <a href="privacy.html">Политика конфиденциальности</a></p>
+        </div>
+
+        <p class="site-contact" id="siteContactLine">Solf.ai · Contact: Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a></p>
+    </div>
+
+    <script>
+        const theme = localStorage.getItem('solfai_theme');
+        if (theme && theme !== 'default') document.documentElement.setAttribute('data-theme', theme);
+        const color = localStorage.getItem('solfai_color');
+        if (color && color !== 'default') document.documentElement.setAttribute('data-color', color);
+
+        const backTexts = { en: '← Back to Solf.ai', ru: '← Вернуться на Solf.ai' };
+        const contactTexts = {
+            en: 'Solf.ai · Contact: Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a>',
+            ru: 'Solf.ai · Контакт: Telegram <a href="https://t.me/vwirex" target="_blank" rel="noopener noreferrer">@vwirex</a>'
+        };
+
+        document.querySelectorAll('.lang-btn').forEach(btn => {
+            btn.addEventListener('click', () => {
+                const lang = btn.dataset.lang === 'ru' ? 'ru' : 'en';
+                document.querySelectorAll('.lang-btn').forEach(b => b.classList.remove('active'));
+                btn.classList.add('active');
+                document.querySelectorAll('.content').forEach(c => c.classList.remove('active'));
+                document.getElementById('content-' + lang).classList.add('active');
+                document.getElementById('backLink').textContent = backTexts[lang];
+                document.getElementById('siteContactLine').innerHTML = contactTexts[lang];
+            });
+        });
+
+        const savedLang = (localStorage.getItem('solfai_lang') === 'ru') ? 'ru' : 'en';
+        document.querySelector(`.lang-btn[data-lang="${savedLang}"]`)?.click();
+    </script>
+</body>
+</html>

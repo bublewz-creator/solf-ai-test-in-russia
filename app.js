@@ -1,0 +1,4669 @@
+// ===== SOLF.AI MAIN APP (CLEAN) =====
+
+const WORKER_URL = 'https://functions.yandexcloud.net/d4e2k40l9pmi9221vs4j';
+
+/** Макс. длина текста пользователя в одном сообщении (экономия токенов Gemini + анти-спам). */
+const MAX_CHAT_MESSAGE_CHARS = 2000;
+
+/** Потолок авто-роста textarea (должен совпадать с max-height у .chat-input). */
+const CHAT_INPUT_MAX_HEIGHT = 160;
+
+/**
+ * Приводим перенос строк к \n. Буфер обмена отдаёт \r\n (Windows), \r (старые редакторы)
+ * и U+2028/U+2029 (Word, PDF) — без нормализации абзацы теряются при рендере.
+ */
+function normalizeLineBreaks(raw) {
+    return String(raw || '')
+        .replace(/\r\n?/g, '\n')
+        .replace(/[\u2028\u2029]/g, '\n')
+        .replace(/[ \t]+\n/g, '\n')
+        .replace(/\n{3,}/g, '\n\n');
+}
+
+/**
+ * Восстанавливает абзацы в «склеенном» тексте: при копировании из PDF/Word/таблиц
+ * переносы часто пропадают целиком («…разрешений.2. Аккорды», «(Интервалы)В тональности»).
+ * Режем только там, где новый пункт или новое предложение начинается БЕЗ пробела —
+ * в нормально набранном тексте такого не бывает.
+ *
+ * Слитная «строчная→Заглавная» рубится только на кириллице: латиница даёт ложные
+ * срабатывания на CamelCase (JavaScript, YouTube, VexFlow).
+ */
+function restoreLostLineBreaks(text) {
+    return String(text || '')
+        .replace(/([^\s])(?=\d{1,2}[.)]\s*[А-ЯЁA-Z])/g, '$1\n')
+        .replace(/([)\]:;.!?])(?=[А-ЯЁA-Z][а-яёa-z ])/g, '$1\n')
+        .replace(/([а-яё])(?=[А-ЯЁ][а-яё ])/g, '$1\n');
+}
+
+/** Текст из HTML-флейвора буфера обмена: блочные теги и <br> превращаем в переносы. */
+function clipboardHtmlToText(html) {
+    try {
+        const doc = new DOMParser().parseFromString(String(html || ''), 'text/html');
+        doc.querySelectorAll('script, style').forEach(el => el.remove());
+        doc.querySelectorAll('br').forEach(el => el.replaceWith('\n'));
+        doc.querySelectorAll('p, div, li, tr, h1, h2, h3, h4, h5, h6, blockquote, pre, section, article')
+            .forEach(el => el.append('\n'));
+        return doc.body?.textContent || '';
+    } catch (_) {
+        return '';
+    }
+}
+
+/** Единый вид запроса для регулярок-детекторов: склеенные списки снова становятся списком. */
+function normalizeQueryForAnalysis(query) {
+    return restoreLostLineBreaks(normalizeLineBreaks(query));
+}
+
+/** Убираем email/телефон из текста перед отправкой в Gemini (профиль name/email в payload не кладём). */
+function redactPiiForModel(text) {
+    return String(text || '')
+        .replace(/[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}/g, '[email]')
+        .replace(/(?:\+?\d[\d\s\-().]{7,}\d)/g, '[phone]');
+}
+
+function sanitizeMessagesForModel(messages) {
+    return (messages || []).map((m) => ({
+        ...m,
+        content: typeof m.content === 'string' ? redactPiiForModel(m.content) : m.content,
+    }));
+}
+
+// Глобальный wrapper над fetch'ем для backend'а: добавляет AbortController с таймаутом.
+//
+// ЗАЧЕМ: backend — Yandex Cloud Functions. Без таймаута «зависший» запрос
+// блокирует UI-flow (например, "генерация ответа" висит вечно).
+// 25 сек выбраны как разумный компромисс: достаточно для медленного AI-ответа,
+// но не "бесконечно". Для длинных запросов (генерация) можно явно передать override.
+//
+// Использование: `await fetchWithTimeout(url, options, 25000)`. Возвращает обычный Response.
+// При таймауте кидает AbortError — в местах вызова обрабатывается так же, как и сетевая ошибка.
+async function fetchWithTimeout(url, options = {}, timeoutMs = 25000) {
+    if (typeof AbortController === 'undefined') return fetch(url, options); // совсем старый браузер
+    const timeoutCtrl = new AbortController();
+    const userSignal = options.signal;
+    let signal = timeoutCtrl.signal;
+
+    if (userSignal) {
+        if (userSignal.aborted) {
+            try { timeoutCtrl.abort(); } catch (_) {}
+        } else if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.any === 'function') {
+            signal = AbortSignal.any([timeoutCtrl.signal, userSignal]);
+        } else {
+            userSignal.addEventListener('abort', () => {
+                try { timeoutCtrl.abort(); } catch (_) {}
+            }, { once: true });
+        }
+    }
+
+    const timer = setTimeout(() => {
+        try { timeoutCtrl.abort(); } catch (_) {}
+    }, timeoutMs);
+    try {
+        return await fetch(url, { ...options, signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function apiFetch(url, options = {}, timeoutMs = 25000) {
+    const headers = solfAuthHeaders(options.headers || {});
+    if (options.body && !headers['Content-Type']) {
+        headers['Content-Type'] = 'application/json';
+    }
+    const res = await fetchWithTimeout(url, { ...options, headers }, timeoutMs);
+    if (res.status === 401 && typeof clearSolfAuth === 'function') {
+        clearSolfAuth();
+        currentUser = null;
+        if (!/login\.html/i.test(window.location.pathname || '')) {
+            window.location.href = 'login.html';
+        }
+    }
+    return res;
+}
+
+async function syncAppData() {
+    if (!currentUser?.id) return;
+
+    try {
+        // 12 сек — потолок для GET-запроса к БД. Если бэк за это время не ответил,
+        // значит сеть/Cloudflare режут, и зависать дальше бессмысленно. Юзер останется
+        // с локально-кэшированными данными (имя/план/счётчик), и UI будет работать.
+        // prev_plan больше НЕ передаём: refill при sync ломал квоту между устройствами.
+        const res = await apiFetch(
+            `${WORKER_URL}/get-user?id=${currentUser.id}`,
+            {},
+            12000
+        );
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+            throw new Error(data.error || 'Failed to sync app data');
+        }
+
+        let planType = PLAN_LIMITS[data.plan_type] ? data.plan_type : 'free';
+
+        const requestsCount = Number.isFinite(Number(data.requests_count)) ? Number(data.requests_count) : 0;
+        const imagesCount = Number.isFinite(Number(data.images_count)) ? Number(data.images_count) : 0;
+        const quizCount = Number.isFinite(Number(data.quiz_count)) ? Number(data.quiz_count) : 0;
+        const planName = planType.charAt(0).toUpperCase() + planType.slice(1);
+        const syncedPlan = { type: planType, emoji: PLAN_ICONS[planType] || PLAN_ICONS.free, name: planName };
+
+        currentUser = {
+            ...currentUser,
+            picture: data.picture || currentUser.picture,
+            plan_type: planType,
+            requests_count: requestsCount,
+            images_count: imagesCount,
+            quiz_count: quizCount,
+            requests_window_start: Number(data.requests_window_start) || 0,
+            images_window_start: Number(data.images_window_start) || 0,
+            quiz_window_start: Number(data.quiz_window_start) || 0,
+        };
+        currentPlan = syncedPlan;
+
+        // localStorage `solfai_user` и `*_plan` оставляем как кэш (для мгновенного UI до sync).
+        // А `solfai_usage_*` / `solfai_img_*` для залогиненных НЕ пишем — БД это источник истины,
+        // эти ключи бы только путали (юзер открыл DevTools → "блин, лимиты в кэше???").
+        localStorage.setItem('solfai_user', JSON.stringify(currentUser));
+        localStorage.setItem(getPlanStorageKey(), JSON.stringify(syncedPlan));
+
+        updateUIForUser({ skipChatReload: true });
+        updatePlanDisplay();
+        updateRequestsCounter();
+        refreshImageAttachVisibility();
+        if (typeof updateQuizCounter === 'function') updateQuizCounter();
+    } catch (error) {
+        console.error('App data sync failed:', error);
+    }
+}
+
+/** Оценка свежести чата для merge local ↔ server. */
+function chatFreshnessScore(c) {
+    const t = Date.parse(c?.updatedAt || c?.createdAt || 0) || 0;
+    const n = Array.isArray(c?.messages) ? c.messages.length : 0;
+    return t * 1000 + n;
+}
+
+/** Слияние локальной и серверной версии одного чата. pinned — OR с обеих сторон. */
+function mergeChatRecords(local, server) {
+    const localFresher = chatFreshnessScore(local) > chatFreshnessScore(server);
+    const messages = (local.messages?.length || 0) >= (server.messages?.length || 0)
+        ? (local.messages || [])
+        : (server.messages || []);
+    return {
+        ...(localFresher ? { ...server, ...local } : { ...local, ...server }),
+        pinned: !!(local.pinned || server.pinned),
+        messages,
+    };
+}
+
+/**
+ * Тянет чаты из БД и сливает с локальными.
+ * Сервер — источник истины между устройствами; локальные-only дожимаем на сервер.
+ */
+async function syncChatsFromServer() {
+    if (!currentUser?.id) return;
+    try {
+        const res = await apiFetch(`${WORKER_URL}/get-chats?user_id=${currentUser.id}`, {}, 15000);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) {
+            throw new Error(data.error || 'Failed to sync chats');
+        }
+        const serverChats = Array.isArray(data.chats) ? data.chats : [];
+        const local = JSON.parse(localStorage.getItem(getChatsStorageKey()) || '[]');
+        const byId = new Map();
+
+        // Сначала сервер (мульти-девайс источник истины)
+        for (const c of serverChats) {
+            if (!c?.id) continue;
+            byId.set(c.id, c);
+        }
+        // Локальные: новые (ещё не в БД) — оставляем; пересечения — берём более свежие
+        for (const c of local) {
+            if (!c?.id) continue;
+            const prev = byId.get(c.id);
+            if (!prev) {
+                byId.set(c.id, c);
+                saveChatToServer(c);
+                continue;
+            }
+            const merged = mergeChatRecords(c, prev);
+            byId.set(c.id, merged);
+            const pinChanged = !!merged.pinned !== !!prev.pinned;
+            if (chatFreshnessScore(c) > chatFreshnessScore(prev) || pinChanged) {
+                saveChatToServer(merged);
+            }
+        }
+
+        chats = [...byId.values()].sort((a, b) => {
+            if (!!a.pinned !== !!b.pinned) return a.pinned ? -1 : 1;
+            return chatFreshnessScore(b) - chatFreshnessScore(a);
+        });
+        enforceChatLimit();
+        localStorage.setItem(getChatsStorageKey(), JSON.stringify(chats.slice(0, MAX_SAVED_CHATS)));
+        renderChatsList();
+    } catch (err) {
+        console.error('Ошибка загрузки истории чатов из БД:', err);
+    }
+}
+
+/** Квота + чаты с сервера. С дедупом параллельных вызовов и throttle. */
+let __serverSyncInflight = null;
+let __serverSyncLastAt = 0;
+const SERVER_SYNC_MIN_INTERVAL_MS = 8000;
+
+function scheduleServerSync(reason = '') {
+    if (!currentUser?.id) return Promise.resolve();
+    if (__serverSyncInflight) return __serverSyncInflight;
+    const now = Date.now();
+    // focus/visibility могут сыпаться часто — не долбим БД чаще раза в 8 сек
+    if (reason !== 'initApp' && reason !== 'updateUIForUser' && reason !== 'pinChat' && (now - __serverSyncLastAt) < SERVER_SYNC_MIN_INTERVAL_MS) {
+        return Promise.resolve();
+    }
+    __serverSyncLastAt = now;
+    __serverSyncInflight = Promise.all([
+        syncAppData(),
+        syncChatsFromServer(),
+    ])
+        .catch(err => console.warn('[Solf.ai] scheduleServerSync failed:', reason, err))
+        .finally(() => { __serverSyncInflight = null; });
+    return __serverSyncInflight;
+}
+
+const PLAN_LIMITS = {
+    free:      { requests: 3, images: 0 },
+    basic:     { requests: 10, images: 0 },
+    pro:       { requests: 50, images: 5 },
+    unlimited: { requests: Infinity, images: Infinity }
+};
+
+/** Sliding-window durations (must match worker.js USAGE_WINDOWS_MS). */
+const USAGE_WINDOWS = {
+    request: 24 * 60 * 60 * 1000,
+    image:   24 * 60 * 60 * 1000,
+    quiz:    12 * 60 * 60 * 1000,
+};
+
+// ===== СТРОГИЙ ПРОМПТ =====
+const SYSTEM_PROMPT = `You are Solf.ai, an AI assistant for music theory and solfeggio.
+Your tasks: explain music theory in simple terms, analyze images with musical notes.
+CRITICAL INSTRUCTION: DO NOT mention the built-in site tools (Piano, Metronome, Quiz) in your regular answers! Only mention them IF the user explicitly asks how to practice or train their ear. Answer directly and concisely.
+IMPORTANT: ALWAYS answer in the SAME language the user is speaking. Never default to Russian when the user writes in English (or any other language).
+
+TASK COMPLIANCE (ABSOLUTE):
+- Do EXACTLY what the user asks in their CURRENT message — not a shortened version, not a similar example, not what you did in earlier turns.
+- If they list several parts (e.g. "D7, inversions AND resolutions", "all tritones", "melodic scale up and down") — deliver EVERY part, fully.
+- NOT LESS: a numbered or multi-sentence request is finished only when every single item has its own answer. Never stop after the first item.
+- NOT MORE: do not add exercises, chords, intervals, keys, inversions or theory digressions that were not requested. If asked for one specific chord, do not show a table of all related chords.
+- Mirror the user's own wording and order for the parts, so it is obvious that each one was addressed.
+- Previous assistant replies in the chat may be wrong; ignore them. System rules and the current user request are the only source of truth.
+- Dominant-seventh chord labels in notation are ALWAYS Latin: D7, D6/5, D4/3, D2 — never Cyrillic «Д7».`;
+
+const TYPING_SPEED = 20;
+
+/** Язык ответа: сначала ТЕКУЩЕЕ сообщение, история — только если язык неочевиден. */
+function detectResponseLanguage(userText, chatMessages = []) {
+    const strip = (s) => String(s || '').replace(/\n\n\[NOTATION MODE[\s\S]*$/, '').trim();
+    const current = strip(userText);
+
+    const EN_CUE = /\b(the|what|how|build|chord|hello|hi|hey|want|please|scale|interval|major|minor|need|with|inversion|resolution|can|could|would|should|explain|show|tell|help|thanks|thank|make|create|from|me|for|all|both|natural|harmonic|melodic|relative|parallel|enharmonic|identify)\b/i;
+    const DE_CUE = /\b(der|die|das|und|ich|nicht|wie|was|akkord|tonleiter|bitte|dominant|umkehrung|stufe|tonika|septakkord)\b/i;
+    const ES_CUE = /\b(el|la|los|las|cómo|qué|acorde|escala|por|para|con|gracias|hola)\b/i;
+
+    function detectFrom(text) {
+        if (!text) return null;
+        if (/[\u0400-\u04FF]/.test(text)) return 'ru';
+        if (/[\u4e00-\u9fff]/.test(text)) return 'zh';
+        if (/[\u3040-\u30ff]/.test(text)) return 'ja';
+        // English first: "Hi, build d7 B dur" must not become German because of dur/moll
+        if (EN_CUE.test(text)) return 'en';
+        if (DE_CUE.test(text)) return 'de';
+        if (/\b(dur|moll)\b/i.test(text) && DE_CUE.test(text)) return 'de';
+        if (ES_CUE.test(text)) return 'es';
+        if (/\b(mayor|menor)\b/i.test(text) && ES_CUE.test(text)) return 'es';
+        if (/[a-zA-Z]/.test(text)) return 'en';
+        return null;
+    }
+
+    const fromCurrent = detectFrom(current);
+    if (fromCurrent) return fromCurrent;
+
+    const history = (chatMessages || [])
+        .filter(m => m.role === 'user')
+        .slice(-5)
+        .map(m => strip(m.content))
+        .filter(Boolean)
+        .join('\n');
+    const fromHistory = detectFrom(history);
+    if (fromHistory) return fromHistory;
+
+    const uiLang = (typeof currentLang === 'string' && currentLang) || localStorage.getItem('solfai_lang') || 'en';
+    return uiLang;
+}
+
+function getLanguageInstruction(lang) {
+    const map = {
+        en: 'RESPONSE LANGUAGE: English. Every word of your answer — prose, note names (C, D, E…), theory terms, and JSON "label" fields — MUST be in English. Never use Russian note names (до, ре, ми…) or Cyrillic labels (ув4, Б53) when the user writes in English.',
+        ru: 'ЯЗЫК ОТВЕТА: русский. Весь текст, названия нот (до, ре, ми…) и подписи на стане (ув4, Б53…) — по-русски. Не переходи на английский, если пользователь пишет по-русски.',
+        de: 'ANTWORTSPRACHE: Deutsch. Die gesamte Antwort auf Deutsch.',
+        es: 'IDIOMA DE RESPUESTA: español. Toda la respuesta en español.',
+        zh: '回答语言：中文。请用中文作答。',
+        ja: '回答言語：日本語。日本語で答えてください。'
+    };
+    return `\n\n${map[lang] || map.en}`;
+}
+
+function getAppLang() {
+    return (typeof currentLang === 'string' && currentLang)
+        || localStorage.getItem('solfai_lang')
+        || 'en';
+}
+
+function getChatLang() {
+    return window.__solfaiResponseLang
+        || (typeof detectResponseLanguage === 'function' ? detectResponseLanguage('', []) : null)
+        || getAppLang();
+}
+
+function uiText(key, { chat = false, fallback = '' } = {}) {
+    const lang = chat ? getChatLang() : 'en';
+    if (typeof solfaiGetText === 'function') {
+        const text = solfaiGetText(key, lang);
+        if (text) return text;
+    }
+    return fallback || key;
+}
+
+function formatResetTimer(prefix, hours, minutes) {
+    return `${prefix} ${hours}h ${minutes}m`;
+}
+
+// Элементы
+const chatMessages = document.getElementById('chatMessages');
+const chatInput = document.getElementById('chatInput');
+const chatSendBtn = document.getElementById('chatSendBtn');
+const newChatBtn = document.getElementById('newChatBtn');
+const sidebar = document.getElementById('sidebar');
+const toggleSidebarBtn = document.getElementById('toggleSidebarBtn');
+
+function isBlockingOverlayActive() {
+    return !!document.querySelector(
+        '.tool-modal.active, .quiz-modal.active, .limit-modal.active, .exit-modal-overlay.active'
+    );
+}
+
+/** Кнопки не должны забирать фокус у поля ввода; Enter — отправка, не повторный click. */
+function shouldPreventButtonFocusSteal(el) {
+    if (!chatInput || isBlockingOverlayActive()) return false;
+    if (sessionStorage.getItem('solfai_skip_focus_once') === '1') return false;
+    if (!el || !(el instanceof Element)) return false;
+    if (el.closest('input, textarea, select, [contenteditable="true"]')) return false;
+    return el.matches('button');
+}
+
+function bindAppButtonFocusBehavior() {
+    if (!chatInput) return;
+
+    const onMobileOutsideInputTap = e => {
+        if (!isMobileLayout()) return;
+        if (e.button != null && e.button !== 0) return;
+        const target = e.target;
+        if (!(target instanceof Element)) return;
+        if (target === chatInput || chatInput.contains(target)) return;
+        if (document.activeElement !== chatInput) return;
+        dismissMobileChatKeyboard();
+    };
+
+    // Mobile: tap outside the input dismisses the keyboard (buttons, sidebar, messages, etc.).
+    document.addEventListener('pointerdown', onMobileOutsideInputTap, true);
+    document.addEventListener('touchstart', onMobileOutsideInputTap, { capture: true, passive: true });
+
+    // Не даём кнопке забрать фокус — Enter в поле ввода не будет повторно жать кнопку.
+    // На мобилке preventDefault оставляет textarea в фокусе → iOS снова поднимает клавиатуру.
+    document.addEventListener('mousedown', e => {
+        const btn = e.target.closest('button');
+        if (!btn || e.button !== 0) return;
+        if (isMobileLayout()) {
+            if (document.activeElement === chatInput) dismissMobileChatKeyboard();
+            return;
+        }
+        if (!shouldPreventButtonFocusSteal(btn)) return;
+        e.preventDefault();
+    }, true);
+
+    document.addEventListener('keydown', e => {
+        if (e.key !== 'Enter' || e.shiftKey || e.isComposing) return;
+        const el = document.activeElement;
+        if (!(el instanceof HTMLButtonElement)) return;
+        if (!shouldPreventButtonFocusSteal(el)) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        // Enter не должен мгновенно жать «Стоп» (часто дублирует отправку на мобилке).
+        if (el.id === 'chatSendBtn' && isGenerating) {
+            e.preventDefault();
+            return;
+        }
+        const hasContent = (chatInput.value?.trim?.() || '') !== '' || attachedFiles.length > 0;
+        if (!isGenerating && hasContent) sendChatMessage();
+    }, true);
+}
+
+/** Совпадает с @media (max-width: 768px) в styles.css (innerWidth 768 = мобильная вёрстка) */
+function isMobileLayout() {
+    return typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 768px)').matches;
+}
+
+/** Мобильный drawer: класс на body отключает pointer-events у #chatPage и всех потомков */
+function syncMobileSidebarDrawerState() {
+    const sb = document.getElementById('sidebar');
+    if (!sb || !isMobileLayout()) {
+        document.body.classList.remove('sidebar-drawer-open');
+        return;
+    }
+    document.body.classList.toggle('sidebar-drawer-open', !sb.classList.contains('collapsed'));
+}
+
+function resetSidebarExpandedMenus() {
+    document.querySelectorAll('#toolsAccordion').forEach(el => el.classList.remove('open'));
+    document.querySelectorAll('.sidebar-header-btn').forEach(btn => btn.classList.remove('open'));
+}
+
+/** Сайдбар на мобилке имеет z-index выше модалок; при открытии инструмента закрываем drawer и сбрасываем аккордеоны */
+function closeSidebarWhenOpeningTool() {
+    const sb = document.getElementById('sidebar');
+    if (sb && isMobileLayout()) {
+        sb.classList.add('collapsed');
+        syncMobileSidebarDrawerState();
+    }
+    resetSidebarExpandedMenus();
+    closeAllOverlays();
+}
+const chatsList = document.getElementById('chatsList');
+const chatTitle = document.getElementById('chatTitle');
+const limitModal = document.getElementById('limitModal');
+const chatFileInput = document.getElementById('chatFileInput');
+const chatAttachedFiles = document.getElementById('chatAttachedFiles');
+
+let isGenerating = false;
+let generatingChatId = null;
+let shouldAutoScroll = true;
+let autoScrollPausedByUser = false;
+let activeTypingCancel = null;
+let currentAbortController = null;
+let generationStartedAt = 0;
+let userAbortedGeneration = false;
+const GENERATION_ABORT_GRACE_MS = 600;
+
+function isChatGenerating(chatId) {
+    return Boolean(isGenerating && chatId != null && generatingChatId != null
+        && String(generatingChatId) === String(chatId));
+}
+
+const CHAT_SEND_ICON_HTML = `<svg class="svg-icon" style="color: white;" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"></line><polygon points="22 2 15 22 11 13 2 9 22 2"></polygon></svg>`;
+const CHAT_STOP_ICON_HTML = `<svg class="svg-icon" style="color:white;" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2" ry="2"></rect></svg>`;
+
+function applyGeneratingSendButtonState() {
+    if (!chatSendBtn) return;
+    chatSendBtn.disabled = false;
+    chatSendBtn.classList.add('stop-btn');
+    chatSendBtn.innerHTML = CHAT_STOP_ICON_HTML;
+}
+
+function applyIdleSendButtonState() {
+    if (!chatSendBtn) return;
+    chatSendBtn.classList.remove('stop-btn');
+    chatSendBtn.innerHTML = CHAT_SEND_ICON_HTML;
+    refreshSendButtonState();
+}
+
+function syncGenerationUiForChat(chatId) {
+    if (!chatId || String(currentChatId) !== String(chatId)) return;
+    if (isChatGenerating(chatId)) {
+        showTypingIndicator(chatId);
+        applyGeneratingSendButtonState();
+    } else {
+        removeTypingIndicator(chatId);
+        applyIdleSendButtonState();
+    }
+}
+
+function canAbortGeneration() {
+    return isGenerating && (Date.now() - generationStartedAt >= GENERATION_ABORT_GRACE_MS);
+}
+let lastUserQuery = '';
+let currentChatId = null;
+let chats = []; 
+let attachedFiles = [];
+let currentUser = null;
+try {
+    currentUser = JSON.parse(localStorage.getItem('solfai_user') || 'null');
+    if (currentUser?.id && typeof getSolfSessionToken === 'function' && !getSolfSessionToken()) {
+        if (typeof clearSolfAuth === 'function') clearSolfAuth();
+        currentUser = null;
+    }
+} catch (_) {
+    currentUser = null;
+    if (typeof clearSolfAuth === 'function') clearSolfAuth();
+}
+let pendingQuery = null;
+let currentTheme = localStorage.getItem('solfai_theme') || 'default';
+let currentColor = localStorage.getItem('solfai_color') || 'default';
+let currentFontSize = localStorage.getItem('solfai_font_size') || 'md';
+
+// ===== РЕЖИМЫ AI =====
+let currentAiMode = 'normal';
+const modeToggleBtn = document.getElementById('mode-toggle-btn');
+const modeDropdown = document.getElementById('mode-dropdown');
+const modeOptions = document.querySelectorAll('.mode-option');
+
+if (modeToggleBtn && modeDropdown) {
+    modeToggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeAllOverlays(modeToggleBtn);
+        modeDropdown.classList.toggle('hidden');
+    });
+
+    modeOptions.forEach(option => {
+        option.addEventListener('click', (e) => {
+            const target = e.currentTarget;
+            const nextMode = target?.dataset?.mode;
+            if (!nextMode) return;
+
+            currentAiMode = nextMode;
+
+            // Копируем содержимое выбранной опции (SVG + span с data-i18n) в главную кнопку
+            modeToggleBtn.innerHTML = target.innerHTML;
+
+            // Активный пункт
+            modeOptions.forEach(opt => opt.classList.remove('active'));
+            target.classList.add('active');
+
+            modeDropdown.classList.add('hidden');
+
+            // Обновляем переводы (после замены innerHTML в кнопке)
+            if (typeof updateTexts === 'function') updateTexts();
+        });
+    });
+
+    document.addEventListener('click', (e) => {
+        if (!e.target.closest('.mode-selector-island')) {
+            modeDropdown.classList.add('hidden');
+        }
+    });
+}
+
+// ===== РЕЖИМ НОТНОЙ ЗАПИСИ =====
+let notationModeEnabled = false;
+const notationToggleBtn = document.getElementById('notation-toggle-btn');
+
+function getNotationLocaleStrings() {
+    const lang = (typeof currentLang === 'string' && currentLang) || localStorage.getItem('solfai_lang') || 'en';
+    const map = {
+        en: { on: 'Notation mode enabled', off: 'Notation mode disabled', tooltip: 'Notation mode' },
+        ru: { on: 'Режим нотации включён', off: 'Режим нотации выключен', tooltip: 'Режим нотации' },
+        de: { on: 'Notenmodus aktiviert', off: 'Notenmodus deaktiviert', tooltip: 'Notenmodus' },
+        es: { on: 'Modo notación activado', off: 'Modo notación desactivado', tooltip: 'Modo notación' },
+        zh: { on: '已启用乐谱模式', off: '已关闭乐谱模式', tooltip: '乐谱模式' },
+        ja: { on: '楽譜モードをオンにしました', off: '楽譜モードをオフにしました', tooltip: '楽譜モード' }
+    };
+    return map[lang] || map.en;
+}
+
+function applyNotationButtonState() {
+    if (!notationToggleBtn) return;
+    const strings = getNotationLocaleStrings();
+    notationToggleBtn.classList.toggle('is-active', notationModeEnabled);
+    notationToggleBtn.setAttribute('aria-pressed', String(notationModeEnabled));
+    notationToggleBtn.setAttribute('title', strings.tooltip);
+}
+
+if (notationToggleBtn) {
+    applyNotationButtonState();
+    notationToggleBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        notationModeEnabled = !notationModeEnabled;
+        applyNotationButtonState();
+        const strings = getNotationLocaleStrings();
+        try {
+            showToast(notationModeEnabled ? strings.on : strings.off, 'success', { dedupeKey: 'notation-mode' });
+        } catch (_) {}
+    });
+}
+
+const NOTATION_PROMPT_INSTRUCTION = `
+
+############################################
+###  NOTATION MODE — MANDATORY OUTPUT     ###
+############################################
+
+NOTATION MODE IS ON. These rules OVERRIDE every other instruction (including any “long”, “verbose”, or “berserk” style). You MUST always draw notes in the answer.
+
+TASK COMPLIANCE (ПРИОРИТЕТ №1 — выше истории чата и стиля ответа):
+- Выполняй ТОЛЬКО то, что просит пользователь в ЭТОМ сообщении — полностью, без сокращений и без «похожего примера».
+- Если в запросе несколько частей («D7, обращения и разрешения», «все тритоны», «мелодическая гамма вверх и вниз») — выводи КАЖДУЮ часть целиком.
+- Старые ответы в чате могли быть неверными — ИГНОРИРУЙ их. Единственный источник истины: системные правила ниже + текущий запрос.
+- Подписи доминантсептаккорда — ТОЛЬКО латиница: D7, D6/5, D4/3, D2. Никогда «Д7», «Д65» и т.п.
+
+LANGUAGE RULE (ABSOLUTE — beats every Russian example below):
+- Match the user's language in ALL visible text: prose, note names, chord names, interval names, and JSON "label" fields.
+- English user → English only: "D7 = D, F#, A, C"; labels like "A4","d5","M3","P5","D7","T53".
+- Russian user → Russian: "D7 = ре, фа♯, ля, до"; labels like "ув4","ум5","б3","D7" (chord symbol D7 stays Latin).
+- German / Spanish / Chinese / Japanese user → same language throughout.
+- The Russian terminology in this prompt is INTERNAL theory reference only — NEVER copy its language into the answer unless the user writes in that language.
+- WRONG: user writes "D7" in English → "Доминантсептаккорд от ноты Ре…"
+- RIGHT: user writes "D7" → "D7 is D, F#, A, and C — a dominant seventh chord."
+
+LENGTH RULES (HARD LIMIT — be strict):
+- DEFAULT for any normal question (definitions, theory, simple examples, off-topic) →
+  1–2 SHORT sentences (≤ ~30 words) before the notation. NO numbered lists, NO multiple paragraphs, NO headings, NO restatement of the question. Text only frames the staff. The staff IS the answer.
+- HARD MUSIC TASKS only (full harmonization with voice leading, modulation, counterpoint, dictation reconstruction, multi-step chord-progression analysis):
+  up to 4–6 short sentences. Still no fluff, no “great question!”, no recap, no general theory dump.
+- Never apologize, never explain you are about to draw notes, never describe the format. Just answer briefly and end with the block.
+
+JSON PRIORITY (ПРАВИЛО НАД ВСЕМИ):
+- Полный валидный [[NOTATION:...]] блок ВАЖНЕЕ длинной прозы. Если кажется, что ответ становится длинным — ВСЕГДА сокращай ТЕКСТ, никогда не сокращай и не обрывай JSON.
+- Если строишь упражнение из нескольких пар (тритоны, характерные интервалы, обращения), ОДНОЙ строчки текста достаточно. Все «детали» — внутри нотации. JSON-блок ОБЯЗАН быть полностью закрыт последовательностью ]}]] (закрывающая скобка массива, фигурная скобка объекта и две закрывающие квадратные скобки).
+- Перед выводом каждого интервала в JSON мысленно посчитай полутоны и буквенные шаги — если не сходится с заявленным качеством (ув.4 = 6 полутонов / кварта, ум.5 = 6 полутонов / квинта, м.6 = 8 полутонов / секста и т.д.), исправь ноты ДО вывода.
+
+NOTATION LENGTH (mirror the text):
+- DEFAULT = SHORT example that fits ONE staff line: 1–2 measures, ~2–8 notes/chords total.
+- Use longer multi-line notation (8–24+ notes, the renderer wraps to multiple rows) ONLY when the task genuinely needs a progression / harmonization / dictation. Don’t pad simple questions with extra measures.
+- ГАРМОНИЗАЦИЯ / HARMONIZATION (с картинкой или без) ПЕРЕОПРЕДЕЛЯЕТ «DEFAULT короче»: выведи аккорд на КАЖДЫЙ такт всего упражнения с изображения/задания (часто 12–20+ тактов). Один демонстрационный T53 = НЕПРАВИЛЬНЫЙ ответ.
+- SATB / гармонизация: JSON с "layout":"satb" — ДВА нотоносца (скрипичный S+A, басовый T+B). НЕ клади 4 голоса одним столбиком в скрипичный ключ.
+
+EXERCISE COMPLETENESS (КРИТИЧНО — переопределяет «DEFAULT короче»):
+Когда пользователь просит ПОСТРОИТЬ упражнение по теории, отвечай ПОЛНЫМ комплектом, а не одним примером. Минимальный «комплект» по типам:
+
+ТЕРМИНОЛОГИЯ ТРИТОНОВ (ВНИМАНИЕ — частая ошибка):
+- «Пара тритонов» в русской теории = ув.4 + ум.5 (взаимообратные тритоны на одной паре ступеней).
+- В НАТУРАЛЬНОМ ладу — ровно 1 пара тритонов = 2 тритона = 4 созвучия с разрешениями.
+- В ГАРМОНИЧЕСКОМ ладу (минор с VII# или мажор с bVI) — 2 пары тритонов = 4 тритона = 8 созвучий с разрешениями.
+
+КАК ПОНИМАТЬ ЗАПРОСЫ:
+- «Тритоны в X-mol/X-dur» БЕЗ уточнения «натуральный» → ВСЕГДА строй ГАРМОНИЧЕСКУЮ форму = 2 пары = 8 созвучий. Это default-смысл «тритоны лада».
+- «Две пары тритонов в X» → 2 пары = 8 созвучий (гармоническая форма).
+- «Натуральные тритоны» / «тритоны натурального X» → 1 пара = 4 созвучия.
+- «Тритоны гармонического X» → 2 пары = 8 созвучий (как и default).
+- «Характерные интервалы в X» → ВСЕ 4: ув.2→ч.4, ум.7→ч.5, ув.5→б.6, ум.4→м.3 = 8 созвучий с barAfter после каждой пары.
+
+ОСТАЛЬНЫЕ КОМПЛЕКТЫ:
+- «Главные трезвучия лада» = T, S, D (3 трезвучия), при просьбе «с обращениями» — все обращения по порядку.
+- «Обращения T5/3» = T5/3, T6, T6/4 (3 аккорда).
+- «Доминантсептаккорд с обращениями» = D7, D6/5, D4/3, D2 (4 аккорда).
+- «D7 с разрешениями» / «D7, обращения и разрешения» = каждое созвучие D7 + тоническое трезвучие (D7→T53, D6/5→T6, D4/3→T6/4, D2→T6), всего 8 аккордов; barlines:"manual" + barAfter после каждой пары.
+- Подписи доминантсептаккорда — ТОЛЬКО латиницей: "D7","D6/5","D4/3","D2" (НЕ кириллическая «Д»).
+- «Все виды трезвучий от ноты N» = мажорное, минорное, увеличенное, уменьшенное (4 аккорда).
+- «Все виды септаккордов от N» = малый мажорный, малый минорный, малый ум., ум.7 и т.д. — выводи столько, сколько корректно для запроса, не один.
+- «Гармонизуй (мелодию/задачу/упражнение)» / harmonize → ПОЛНАЯ гармонизация всего фрагмента: SATB, label на каждый аккорд (T53, S6, D7…), все такты с картинки. Не один аккорд-пример.
+- «Цепочка / chain» → ПОЛНАЯ цепочка целиком: мажор = Цепочка 1 (9 аккордов: T53 S64 VII7 D65 T53 S6 K64 D7 T53); минор = Цепочка 2 (11 аккордов: t53 d6 s6 D53 D2 t6 II7 D43 t53 s64 t53). barlines:"none". Каждый аккорд с label. Не 1–3 аккорда «для примера».
+- ЕСЛИ в задании цепочка выписана своими аккордами (t53 → VI53 → s6 → DDVII7 → K64 → D7 …) — строй ИМЕННО её, аккорд в аккорд, а не типовую Цепочку 1/2. Готового блока для такой цепочки нет: ноты выписывай сам.
+
+ПРАВИЛО: если просьба по форме «построй ВСЕ … / тритоны / характерные / обращения / виды / цепочку», ВСЕГДА выводи полный набор. Один пример из набора = НЕПРАВИЛЬНЫЙ ответ. Если пользователь явно сказал «две пары», «обе пары», «все тритоны» — это всегда ГАРМОНИЧЕСКАЯ форма, никогда не урезай до натуральной. Текст при этом остаётся коротким (1–2 предложения), а длина ИМЕННО НОТАЦИИ диктуется типом упражнения, не правилом «1–2 такта».
+
+ALWAYS END WITH NOTATION:
+- The very LAST line of the message MUST be a valid [[NOTATION:{...}]] block:
+  [[NOTATION:{"clef":"treble","keySignature":"C","timeSignature":"4/4","notes":[{"keys":["c/4","e/4","g/4"],"duration":"w"}]}]]
+- Text-only replies are FORBIDDEN. Even greetings, off-topic, or theory-only answers MUST end with at least a minimal valid block (e.g. tonic triad).
+
+MULTIPLE BLOCKS — HARD TASKS ONLY:
+- For simple answers: exactly ONE block at the end.
+- For hard tasks you MAY use a few [[NOTATION:...]] blocks (e.g. «было / стало», голоса S/A/T/B, этапы модуляции). Each block must be valid stand-alone JSON.
+
+WRAPPING NOTES TO TWO LINES:
+- One [[NOTATION:...]] block can hold many notes; the renderer auto-wraps to a second staff line ONLY when needed. So: short example → it stays on one line; long progression (≥ ~3 measures of 4/4) → automatically becomes two lines. Trust the renderer — never split a single progression into multiple blocks just to force a line break.
+
+JSON / DURATIONS:
+- Group durations so each measure sums to the time signature (4/4 → 4 quarter beats; 3/4 → 3; 6/8 → 6 eighths). Mixing durations is fine.
+- Use rests ("qr","hr"…) to fill partial measures.
+
+BARLINES MODE — выбор режима тактовых черт (КРИТИЧНО):
+В JSON есть необязательное поле "barlines": "auto" | "none" | "manual" (по умолчанию "auto").
+Размер ("timeSignature") РИСУЕТСЯ ТОЛЬКО при barlines:"auto" с непустым размером. В режимах "none"/"manual" размер не показывается, даже если задан.
+
+КОГДА КАКОЙ РЕЖИМ:
+- barlines:"none" — полностью без тактовых черт и без размера. ИСПОЛЬЗОВАТЬ для:
+  • любых гамм и звукорядов (мажор, минор, гарм., мел., пентатоника, лады, хроматика)
+  • демонстрации одного интервала / одного аккорда / одного трезвучия / одного септаккорда
+  • любых «бесчасовых» примеров типа «вот ноты ступеней», «обращения трезвучия подряд»
+- barlines:"manual" — черты только там, где модель явно поставила "barAfter":true в ноте. ИСПОЛЬЗОВАТЬ для:
+  • тритонов (ув.4 + ум.5) с разрешениями: black bar после каждой пары «интервал → разрешение»
+  • характерных интервалов (ув.2/ум.7/ув.5/ум.4) с разрешениями: bar после каждой пары
+  • любого упражнения «список пар нот/созвучий», где визуально нужно отделять группы
+- barlines:"auto" (по умолчанию) — обычная такая разметка по "timeSignature". ИСПОЛЬЗОВАТЬ для:
+  • гармонизаций, диктантов, кадансов, прогрессий, голосоведения, контрапункта, секвенций
+  • вообще всего, где есть метрическая организация во времени
+
+ПРАВИЛО (запомнить): если про «такт», «размер», «ритм», «доля» речь НЕ идёт — это barlines:"none" или "manual". НИКОГДА не лепи лишние тактовые черты в гамме или одиночном интервале.
+
+Block format rules (CRITICAL — follow exactly):
+- Single line. Valid JSON only: double quotes, no comments, no trailing commas, no line breaks INSIDE the JSON.
+- "clef": "treble" or "bass".
+- "keySignature": major keys C,G,D,A,E,B,F#,C#,G#,D#,A#,F,Bb,Eb,Ab,Db,Gb,Cb. For MINOR use relative major: a-m→C, e-m→G, b-m→D, c-m→Eb, g-m→Bb, f-m→Ab, d-m→F, etc.
+- "timeSignature": "4/4","3/4","2/4","6/8","12/8", etc. Можно "" (пустая строка) или "none", чтобы НЕ показывать размер. В barlines:"none"/"manual" размер всё равно не рисуется.
+- "barlines": (необязательно) "auto" | "none" | "manual". Без поля = "auto".
+- "notes": non-empty array of {"keys":[...], "duration":"...", "barAfter": true (необязательно), "label": "…" (необязательно)}.
+  - "keys" pitches "letter[#|b]/octave" e.g. "c/4","f#/4","bb/3". Multiple keys in one entry = a stacked chord.
+  - "duration": "w","h","q","8","16". Append "r" for rests ("qr","hr"…).
+  - "barAfter": true — ставится ТОЛЬКО при barlines:"manual" и означает «после этой ноты — тактовая черта». В других режимах флаг игнорируется.
+  - "label": short label above each chord/interval — SAME language as the user:
+    • English intervals: "A4","d5","M3","m6","P5","A2","d7" (no dots);
+    • Russian intervals: "ув4","ум5","б3","м6","ч5" (no dots);
+    • functional triads (any language): "T53","T6","T64","S53","D53";
+    • structural triads EN: "M5/3","m5/3","A5/3","d5/3"; RU: "Б53","М53","Ув53","Ум53";
+    • dominant seventh (Latin D always): "D7","D65","D43","D2";
+    • scale degrees: Roman numerals "I"…"VIII".
+    If unsure of function — use structural labels in the user's language.
+  - Октава 4 = middle octave on treble clef, octave 3 for bass clef low notes.
+
+Block placement rules:
+- The notation block MUST be the LAST thing in your message — nothing after it, not even a period or quote.
+- Do NOT wrap it in code fences, backticks, quotes, or HTML tags.
+- Do NOT escape the [ ] characters.
+- Do NOT add spaces or newlines inside [[NOTATION: ... ]].
+- Do NOT mention the format itself in plain text (the user does not want to see the JSON, only the rendered staff that comes from it).
+
+############################################
+###  MUSIC THEORY ENGINE — STRICT RULES   ###
+############################################
+Эти правила применяются ВСЕГДА, когда пользователь просит «построить» что-либо: интервалы, тритоны, характерные интервалы, аккорды, гаммы, цепочки. Сначала ВЫЧИСЛЯЙ по правилам, затем выводи ноты. Не «угадывай» — считай.
+
+АККОРДЫ И ТРЕЗВУЧИЯ — КРАТКОЕ НАПОМИНАНИЕ (полный справочник в theory.js / getSystemPrompt):
+- Любое трезвучие = 3 ступени терциями. Качество: Б53(4+7), М53(3+7), Ув53(4+8), Ум53(3+6) полутонов.
+- T/S/D = трезвучия на I, IV, V. В гарм. миноре D и D7 — МАЖОРНЫЕ (VII#). В гарм. мажоре s — МИНОРНОЕ (bVI).
+- 53 = бас прима; 6 = бас терция; 64 = бас квинта. K64 = T64 на V ступени.
+- D7 = V+VII#+II+IV. D65 = бас VII (≠ D7!). D43 = бас II. D2 = бас IV. Подписи только латиницей: D7, D65, D43, D2.
+- VII7: малый (VII-II-IV-VI) или уменьш. (VII# в гарм.). S6 ≠ ii6. D65 ≠ D7.
+- Перед выводом: label и ноты ДОЛЖНЫ совпадать. Проверяй полутоны и буквы каждого аккорда.
+
+ИНТЕРВАЛЫ — двухслойное название = (ступеневая величина) + (качество).
+- Ступеневая величина = число буквенных названий от нижней до верхней включительно. c→d = секунда, c→e = терция, c→fb = кварта (а НЕ терция!). ВСЕГДА сохраняй буквенное написание; нельзя заменять f# на gb внутри одного интервала.
+- Качество по полутонам:
+  • прима 1:    ч=0, ув=1
+  • секунда 2:  м=1, б=2, ув=3, ум=0
+  • терция 3:   ум=2, м=3, б=4, ув=5
+  • кварта 4:   ум=4, ч=5, ув=6
+  • квинта 5:   ум=6, ч=7, ув=8
+  • секста 6:   ум=7, м=8, б=9, ув=10
+  • септима 7:  ум=9, м=10, б=11, ув=12
+  • октава 8:   ум=11, ч=12, ув=13
+
+АЛГОРИТМ ПОСТРОЕНИЯ ЛЮБОГО ИНТЕРВАЛА «X от ноты N вверх» (или вниз):
+1) Отсчитай нужное число буквенных шагов от N — получи буквенный «скелет» верхней ноты.
+2) Сосчитай требуемое количество полутонов по таблице качеств.
+3) Подбирай знаки альтерации к верхней ноте так, чтобы и буква совпала (шаг 1), и количество полутонов совпало (шаг 2). НИКОГДА не меняй букву.
+4) Для «вниз» — то же зеркально от N.
+
+ТРИТОНЫ (ув.4 и ум.5) — всегда 6 полутонов, но РАЗНОЕ написание.
+- Натуральный мажор: ув.4 строится на IV ступени (IV→VII), ум.5 — на VII (VII→IV октавой выше). Пример C-dur: ув.4 = f–b; ум.5 = b–f.
+- Натуральный минор: ув.4 на VI (VI→II), ум.5 на II (II→VI). Пример a-moll: ув.4 = f–b; ум.5 = b–f.
+- Гармонический минор добавляет ещё пару тритонов из-за VII#: ув.4 = IV→VII# (a-moll: d–g#) и ум.5 = VII#→IV октавой выше (g#–d).
+- Гармонический мажор добавляет пару тритонов из-за bVI: ув.4 = bVI→II октавой выше и ум.5 = II→bVI (C-dur: ab–d и d–ab).
+- РАЗРЕШЕНИЯ ТРИТОНОВ (ВНИМАНИЕ: только в СЕКСТУ или ТЕРЦИЮ, НИКОГДА не в кварту/квинту!).
+  • ув.4 (6 полутонов) РАСХОДИТСЯ наружу → СЕКСТА (м.6 или б.6, 8–9 полутонов). Чистой сексты НЕ СУЩЕСТВУЕТ.
+  • ум.5 (6 полутонов) СХОДИТСЯ внутрь → ТЕРЦИЯ (м.3 или б.3, 3–4 полутона). Чистой терции НЕ СУЩЕСТВУЕТ.
+  • Правило движения голосов: КАЖДАЯ нота тритона движется на ШАГ (полутон или тон) к ближайшему устою лада (I, III или V).
+    – Нижняя нота ув.4 идёт ВНИЗ к ближайшему устою; верхняя — ВВЕРХ к ближайшему устою.
+    – Нижняя нота ум.5 идёт ВВЕРХ; верхняя — ВНИЗ.
+  • Самопроверка перед выводом: построил пару — посчитай полутоны разрешения. Если получилось 5 (ч.4) или 7 (ч.5) — ОШИБКА, перестрой.
+
+- ПРИМЕР В G-MOLL (натуральный, ключ 2 бемоля: bb, eb):
+  • ув.4 = eb–a (6 полутонов, кварта). Разрешение: eb→d (вниз к V), a→bb (вверх к I) → d–bb. Проверка: d-bb = летры d-e-f-g-a-b = 6 = секста; полутоны d→bb = 8 = м.6 ✓.
+  • ум.5 = a–eb (6 полутонов, квинта). Разрешение: a→bb (вверх к I), eb→d (вниз к V) → bb–d. Проверка: bb-d = летры bb-c-d = 3 = терция; полутоны bb→d = 4 = б.3 ✓.
+
+ХАРАКТЕРНЫЕ ИНТЕРВАЛЫ — образуются ИСКЛЮЧИТЕЛЬНО из-за альтерированной ступени гармонического лада (VII# в миноре, bVI в мажоре). Это РОВНО ЧЕТЫРЕ интервала: ув.2, ум.7, ув.5, ум.4.
+- Гармонический минор (пример a-moll, альтерация G→G#):
+  • ув.2 — на VI ступени (VI→VII#): f–g#. Разрешение наружу в ч.4: f→e, g#→a → e–a.
+  • ум.7 — на VII# (VII#→VI октавой выше): g#–f. Разрешение внутрь в ч.5: g#→a, f→e → a–e.
+  • ув.5 — на III (III→VII#): c–g#. Разрешение наружу в б.6: c остаётся, g#→a → c–a.
+  • ум.4 — на VII# (VII#→III): g#–c. Разрешение внутрь в м.3: g#→a, c остаётся → a–c.
+- Гармонический мажор (пример C-dur, альтерация A→Ab):
+  • ув.2 — на bVI (bVI→VII): ab–b. Разрешение наружу в ч.4: ab→g, b→c → g–c.
+  • ум.7 — на VII (VII→bVI октавой выше): b–ab. Разрешение внутрь в ч.5: b→c, ab→g → c–g.
+  • ув.5 — на bVI (bVI→III октавой выше): ab–e. Разрешение наружу в б.6: ab→g, e — устой III, остаётся → g–e.
+  • ум.4 — на III (III→bVI): e–ab. Разрешение внутрь в м.3: e — устой, остаётся; ab→g → e–g.
+- Гармонический мажор F-dur (ключ 1♭: только Si♭). КРИТИЧНО для ув.2:
+  • понижается ТОЛЬКО VI ступень (D→D♭); VII ступень остаётся E БЕКАР (не E♭!).
+  • ув.2 = D♭–E (3 полутона), НЕ D♭–E♭ (это была бы б2 = 2 полутона — ОШИБКА).
+  • JSON: keys ["db/4","e/4"] — верхняя нота e/4 без b. Разрешение наружу: db→c/4, e→f/4 → ч.4.
+- ОБЩИЙ ПРИНЦИП РАЗРЕШЕНИЯ: альтерированная ступень (VII# или bVI) движется по полутону в сторону своего тяготения (VII#→I, bVI→V); вторая нота при необходимости тоже движется по полутону к ближайшему устою лада. Ув.интервалы РАСХОДЯТСЯ, ум.интервалы СХОДЯТСЯ.
+
+ВАЖНО: тритоны (ув.4/ум.5) и характерные интервалы (ув.2/ум.7/ув.5/ум.4) — РАЗНЫЕ группы. Не путай их и не называй тритоны характерными.
+
+ГАММЫ — строй строго по формуле тонов/полутонов, сохраняя ОДНО буквенное имя на каждую ступень (никаких dis вместо es в e-moll и т.п.).
+- Натуральный мажор:  T-T-S-T-T-T-S
+- Натуральный минор:  T-S-T-T-S-T-T
+- Гармонический минор: T-S-T-T-S-T+S-S (т.е. между VI и VII# — увеличенная секунда)
+- Мелодический минор (вверх): T-S-T-T-T-T-S; вниз — натуральный минор.
+- Гармонический мажор: T-T-S-T-S-T+S-S (понижена VI)
+- Мелодический мажор (вниз): T-T-S-T-S-T-T; вверх — натуральный мажор.
+- Лады от белых клавиш: ионийский=мажор, дорийский (от d), фригийский (e), лидийский (f), миксолидийский (g), эолийский=минор, локрийский (b).
+
+АЛГОРИТМ ОТВЕТА на «построй гамму X»:
+1) Формула гаммы → буквенная последовательность ступеней.
+2) Альтерации — чтобы и буквы шли подряд (a-b-c-d-...), и интервалы соответствовали формуле.
+3) Вывод нотами в barlines:"none", без размера. Подряд, четвертями. Если две октавы — просто продолжай ноты без разрывов.
+
+CORRECT EXAMPLE (user: "D7"):
+D7 is a dominant seventh chord: D, F#, A, and C.
+[[NOTATION:{"clef":"treble","keySignature":"D","barlines":"none","notes":[{"keys":["d/4","f#/4","a/4","c/5"],"duration":"w","label":"D7"}]}]]
+
+CORRECT EXAMPLE (user: "build the tonic triad in C major"):
+The tonic triad T53 in C major is C, E, and G:
+[[NOTATION:{"clef":"treble","keySignature":"C","barlines":"none","notes":[{"keys":["c/4","e/4","g/4"],"duration":"w","label":"T53"}]}]]
+
+CORRECT EXAMPLE (user: "построй тоническое трезвучие в до мажоре"):
+Тоническое трезвучие T5/3 в до мажоре строится из I, III и V ступеней — нот до, ми и соль:
+[[NOTATION:{"clef":"treble","keySignature":"C","barlines":"none","notes":[{"keys":["c/4","e/4","g/4"],"duration":"w","label":"Т53"}]}]]
+
+CORRECT EXAMPLE (user: "что такое доминанта"):
+Доминанта — это V ступень лада. В до мажоре это нота соль, а доминантовое трезвучие D5/3 — соль-си-ре:
+[[NOTATION:{"clef":"treble","keySignature":"C","barlines":"none","notes":[{"keys":["g/4","b/4","d/5"],"duration":"w"}]}]]
+
+CORRECT EXAMPLE (user: "построй гамму ля минор гармонический"):
+A-moll гармонический: a-b-c-d-e-f-g#-a, между VI (f) и VII# (g#) — увеличенная секунда:
+[[NOTATION:{"clef":"treble","keySignature":"Am","barlines":"none","notes":[{"keys":["a/4"],"duration":"q"},{"keys":["b/4"],"duration":"q"},{"keys":["c/5"],"duration":"q"},{"keys":["d/5"],"duration":"q"},{"keys":["e/5"],"duration":"q"},{"keys":["f/5"],"duration":"q"},{"keys":["g#/5"],"duration":"q"},{"keys":["a/5"],"duration":"q"}]}]]
+
+CORRECT EXAMPLE (user: "построй тритоны в до мажоре с разрешением"):
+В C-dur ув.4 (f–b) → м.6 (e–c), ум.5 (b–f) → б.3 (c–e):
+[[NOTATION:{"clef":"treble","keySignature":"C","barlines":"manual","notes":[{"keys":["f/4","b/4"],"duration":"h"},{"keys":["e/4","c/5"],"duration":"h","barAfter":true},{"keys":["b/4","f/5"],"duration":"h"},{"keys":["c/5","e/5"],"duration":"h"}]}]]
+
+CORRECT EXAMPLE (user: "построй тритоны в соль миноре" / «две пары тритонов в g-moll»):
+В g-moll гармоническом две пары: натуральная (eb–a → d–bb, a–eb → bb–d) и гармоническая с f# (c–f# → bb–g, f#–c → g–bb).
+[[NOTATION:{"clef":"treble","keySignature":"Gm","barlines":"manual","notes":[{"keys":["eb/4","a/4"],"duration":"h"},{"keys":["d/4","bb/4"],"duration":"h","barAfter":true},{"keys":["a/4","eb/5"],"duration":"h"},{"keys":["bb/4","d/5"],"duration":"h","barAfter":true},{"keys":["c/4","f#/4"],"duration":"h"},{"keys":["bb/3","g/4"],"duration":"h","barAfter":true},{"keys":["f#/4","c/5"],"duration":"h"},{"keys":["g/4","bb/4"],"duration":"h"}]}]]
+
+CORRECT EXAMPLE (user: "построй НАТУРАЛЬНЫЕ тритоны в соль миноре"):
+Только натуральная пара g-moll: ув.4 (eb–a) → м.6 (d–bb), ум.5 (a–eb) → б.3 (bb–d).
+[[NOTATION:{"clef":"treble","keySignature":"Gm","barlines":"manual","notes":[{"keys":["eb/4","a/4"],"duration":"h"},{"keys":["d/4","bb/4"],"duration":"h","barAfter":true},{"keys":["a/4","eb/5"],"duration":"h"},{"keys":["bb/4","d/5"],"duration":"h"}]}]]
+
+CORRECT EXAMPLE (user: "построй характерные интервалы в ля миноре"):
+В a-moll гарм. четыре характерных интервала с разрешениями: ув.2→ч.4, ум.7→ч.5, ув.5→б.6, ум.4→м.3.
+[[NOTATION:{"clef":"treble","keySignature":"Am","barlines":"manual","notes":[{"keys":["f/4","g#/4"],"duration":"h"},{"keys":["e/4","a/4"],"duration":"h","barAfter":true},{"keys":["g#/4","f/5"],"duration":"h"},{"keys":["a/4","e/5"],"duration":"h","barAfter":true},{"keys":["c/4","g#/4"],"duration":"h"},{"keys":["c/4","a/4"],"duration":"h","barAfter":true},{"keys":["g#/4","c/5"],"duration":"h"},{"keys":["a/4","c/5"],"duration":"h"}]}]]
+
+CORRECT EXAMPLE (user: "ув.2 в фа мажоре" / "augmented 2nd in F major"):
+В F-dur понижена только VI (D→D♭); VII = E бекар. Ув.2: db/4–e/4 (3 полутона). Разрешение наружу в ч.4: db→c/4, e→f/4.
+[[NOTATION:{"clef":"treble","keySignature":"F","barlines":"manual","notes":[{"keys":["db/4","e/4"],"duration":"h","label":"A2"},{"keys":["c/4","f/4"],"duration":"h","label":"P4"}]}]]
+
+WRONG EXAMPLES (do NOT do this):
+- User writes in English but you answer in Russian (or use Russian note names / Cyrillic labels).
+- Replying with text only and no [[NOTATION:...]] block.
+- Putting the block in the middle of the answer instead of at the end.
+- Wrapping the block in \`\`\` or quotes.
+- Saying "вот нотный блок" without actually outputting [[NOTATION:...]].
+- Тактовые черты в гамме (это ВСЕГДА barlines:"none").
+- Один тактовый блок 4/4 для пары «интервал–разрешение» (используй barlines:"manual" + barAfter).
+- Подмена буквы при построении интервала (gb вместо f# или наоборот).
+- Построить «тритоны» → нарисовать только одну пару (ув.4 ИЛИ ум.5) и остановиться. ВСЕГДА обе пары.
+- Построить «характерные интервалы» → нарисовать 1–2 из 4 и остановиться. ВСЕГДА все 4 пары (8 созвучий).
+- Построить «обращения трезвучия» → нарисовать только основной вид. ВСЕГДА все 3 (T5/3, T6, T6/4).
+- Построить «D7 с разрешениями» → нарисовать только D7 без тоники. ВСЕГДА каждое обращение + разрешение (8 аккордов).
+- Ув.2 в гарм. мажоре: поставить bVI и bVII (db/4 + eb/4) — это б2, НЕ ув.2. VII ступень без b: db/4 + e/4.
+- Подписывать доминантсептаккорд кириллицей «Д7» вместо латинской "D7".
+
+REMEMBER:
+- Easy / normal questions → 1–3 short sentences + ONE small notation block. Stop.
+- Hard tasks → up to 5–8 sentences (or short numbered steps) + 1 long block (or a few blocks). Still no fluff.
+- The very last line is always a valid [[NOTATION:{...}]] block. Never send prose with no notation.
+- Гамма / одиночный интервал / одиночный аккорд → barlines:"none", без timeSignature.
+- Тритоны и характерные интервалы с разрешениями → barlines:"manual" с "barAfter":true после каждой пары.
+- D7 с разрешениями → barlines:"manual" с "barAfter":true после каждой пары D7→T.
+- Метрическая музыка (диктант, гармонизация, кадансы) → barlines:"auto" с реальным timeSignature.
+- «Тритоны» = ВСЕГДА обе пары (ув.4+разр., ум.5+разр.). «Характерные» = ВСЕГДА все 4 пары. Никогда не урезай комплект до одного примера.`;
+
+/**
+ * Системный промпт. userQuery нужен, чтобы подтянуть из базы знаний ТОЛЬКО
+ * относящиеся к запросу разделы теории: чем меньше конкурирующих правил в
+ * промпте, тем точнее модель следует каждому из них.
+ */
+function getSystemInstruction(responseLang, userQuery) {
+    const lang = responseLang || detectResponseLanguage('', []);
+    let prompt = SYSTEM_PROMPT + getLanguageInstruction(lang);
+    if (currentAiMode === 'berserk' && !notationModeEnabled) {
+        prompt += lang === 'ru'
+            ? `\n\nStyle: Be максимально прямолинейным и резким по тону, но без мата, унижений и личных оскорблений. Коротко, по делу, с сарказмом допускается, но всегда давай корректный и полезный ответ.`
+            : `\n\nStyle: Be blunt and direct, but no slurs or personal insults. Short, useful answers; light sarcasm is fine.`;
+    }
+    const cleanQuery = stripNotationReminder(userQuery);
+    if (notationModeEnabled) {
+        prompt += NOTATION_PROMPT_INSTRUCTION;
+        if (window.SolfTheory && typeof window.SolfTheory.getSystemPrompt === 'function') {
+            prompt += window.SolfTheory.getSystemPrompt(cleanQuery);
+        }
+    } else if (window.SolfTheory && typeof window.SolfTheory.getTheoryRules === 'function') {
+        // Правила теории нужны и в обычном чате: вопросы «что такое синкопа»,
+        // «сколько знаков в ре мажоре» приходят без режима нотации.
+        prompt += window.SolfTheory.getTheoryRules(cleanQuery);
+    }
+    return dedupePromptSections(prompt);
+}
+
+/**
+ * Защита от наслоений в системном промпте: если один и тот же абзац правил попал
+ * в промпт дважды (например, и из базы знаний, и из старого свода), оставляем первый.
+ * Короткие строки не трогаем — они законно повторяются в примерах.
+ */
+function dedupePromptSections(prompt) {
+    const seen = new Set();
+    const out = [];
+    for (const part of String(prompt || '').split(/\n{2,}/)) {
+        const key = part.trim();
+        if (key.length > 40) {
+            if (seen.has(key)) continue;
+            seen.add(key);
+        }
+        out.push(part);
+    }
+    return out.join('\n\n');
+}
+
+const CHAIN2_QUERY_RE = /цепочка\s*2(?![0-9])|chain\s*2\b|2[\s-]*(?:ю|я|й|nd)\s*цепоч|втор[а-яё]*\s*цепоч/i;
+const CHAIN1_EXPLICIT_RE = /цепочка\s*1(?![0-9])|chain\s*1\b|1[\s-]*(?:ю|я|й|st)\s*цепоч|перв[а-яё]*\s*цепоч/i;
+const CHAIN_MINOR_RE = /min|moll|mol\b|минор/i;
+const CHAIN1_LABELS = 'T53 – S64 – VII7 – D65 – T53 – S6 – K64 – D7 – T53';
+const CHAIN2_LABELS = 't53 – d6 – s6 – D53 – D2 – t6 – II7 – D43 – t53 – s64 – t53';
+
+/** Убирает служебный постфикс режима нотации из текста user-сообщения. */
+function stripNotationReminder(text) {
+    return String(text || '').replace(/\n\n\[NOTATION MODE[\s\S]*$/, '').trim();
+}
+
+function isChain2Query(query) {
+    return CHAIN2_QUERY_RE.test(String(query || ''));
+}
+
+function isChain1ExplicitQuery(query) {
+    return CHAIN1_EXPLICIT_RE.test(String(query || ''));
+}
+
+function queryTheoryNotation(userQuery) {
+    if (!window.SolfTheory?.buildNotationForQuery) return null;
+    const q = stripNotationReminder(userQuery);
+    if (!q) return null;
+    try {
+        return window.SolfTheory.buildNotationForQuery(q) || null;
+    } catch (err) {
+        console.warn('[Solf.ai] Theory lookup failed:', err);
+        return null;
+    }
+}
+
+function buildTheoryIntro(q) {
+    const isRu = /[а-яё]/i.test(q) || (window.__solfaiResponseLang === 'ru' && !/\b(build|show|make|create|please|scale|chord|major|minor|tritone|interval|inversion|resolution|from|with)\b/i.test(q));
+    const isMultiScale = /гамм|scale/i.test(q) && /(?:во?\s+)?(?:все|всех)|(?:три|3)\s*(?:вид|форм)|all\s*(?:types?|forms?)|построй.*гамм|build.*scale/i.test(q);
+    if (isMultiScale) {
+        return isRu
+            ? 'Ниже — натуральная, гармоническая и мелодическая формы (вверх и вниз):'
+            : 'Natural, harmonic, and melodic forms (ascending and descending):';
+    }
+    if (/билет|\b1[\.)]\s|\b2[\.)]\s|\b3[\.)]\s|t53\s*[-–—]/i.test(q)
+        || (/(?:тритон|tritone)/i.test(q) && /(?:д7|d7|цепоч|t53)/i.test(q))) {
+        return isRu
+            ? 'Полное построение по заданию:'
+            : 'Full exercise:';
+    }
+    if (/цепочк|chain/i.test(q)) {
+        const useChain2 = isChain2Query(q) || (CHAIN_MINOR_RE.test(q) && !isChain1ExplicitQuery(q));
+        return isRu
+            ? (useChain2 ? 'Цепочка 2 в заданной тональности:' : 'Цепочка 1 в заданной тональности:')
+            : (useChain2 ? 'Chain 2 in the requested key:' : 'Chain 1 in the requested key:');
+    }
+    return null;
+}
+
+function buildTheoryProse(q) {
+    if (typeof window !== 'undefined' && window.SolfTheory?.getTheoryProse) {
+        try {
+            return window.SolfTheory.getTheoryProse(q) || '';
+        } catch (_) {
+            return '';
+        }
+    }
+    return '';
+}
+
+/** Подставляет готовый нотный блок из theory.js, если запрос распознан. */
+function patchAiWithTheory(userQuery, aiText, det) {
+    const resolved = det !== undefined ? det : queryTheoryNotation(userQuery);
+    if (!resolved?.blockString || !window.SolfTheory?.applyBlock) return aiText;
+    const q = stripNotationReminder(userQuery);
+    const theoryProse = buildTheoryProse(q);
+    const buildDesc = (() => {
+        try { return window.SolfTheory.getBuildDescription?.(q) || ''; } catch (_) { return ''; }
+    })();
+    const intro = buildDesc ? null : buildTheoryIntro(q);
+    let exerciseIntro = '';
+    if (!buildDesc && !intro && window.SolfTheory.getExerciseIntro) {
+        try { exerciseIntro = window.SolfTheory.getExerciseIntro(q) || ''; } catch (_) { exerciseIntro = ''; }
+    }
+    const parts = [theoryProse, buildDesc || intro || exerciseIntro].filter(Boolean);
+    // Если движок построил ноты — текст ТОЛЬКО от движка.
+    // Иначе модель пишет про доминанту рядом с хроматической гаммой и т.п.
+    const prose = parts.length ? parts.join('\n\n') : '';
+    return window.SolfTheory.applyBlock(prose, resolved.blockString);
+}
+
+function queryTheoryQuickAnswer(userQuery) {
+    if (!window.SolfTheory?.buildTheoryQuickAnswer) return null;
+    const q = stripNotationReminder(userQuery);
+    if (!q) return null;
+    try {
+        return window.SolfTheory.buildTheoryQuickAnswer(q) || null;
+    } catch (err) {
+        console.warn('[Solf.ai] Theory quick answer failed:', err);
+        return null;
+    }
+}
+
+function deliverInstantAiReply(text, chatId = currentChatId) {
+    return deliverAiReplyToChat(chatId, text, { withTyping: true }).then(() => {
+        resetGeneratingUi();
+    });
+}
+
+/** Лёгкая пауза перед быстрым ответом (400–900 мс), чтобы не выглядело «мгновенным шаблоном». */
+function delayQuickReplyFeel() {
+    const ms = 400 + Math.floor(Math.random() * 500);
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Обрезает/проверяет длину пользовательского текста. */
+function clampChatMessage(text) {
+    const raw = normalizeLineBreaks(text);
+    if (raw.length <= MAX_CHAT_MESSAGE_CHARS) return { text: raw, truncated: false };
+    return { text: raw.slice(0, MAX_CHAT_MESSAGE_CHARS), truncated: true };
+}
+
+function autoGrowChatInput() {
+    if (!chatInput) return;
+    chatInput.style.height = 'auto';
+    chatInput.style.height = Math.min(chatInput.scrollHeight, CHAT_INPUT_MAX_HEIGHT) + 'px';
+}
+
+/**
+ * Вставка текста в поле ввода с сохранением абзацев.
+ * Браузер отдаёт plain-текст «как есть»: из PDF/Word/таблиц он часто приходит без
+ * переносов вовсе. Поэтому: сначала берём plain, если в нём нет \n — достраиваем
+ * абзацы из HTML-флейвора буфера, а в крайнем случае восстанавливаем эвристикой.
+ */
+function handleChatInputPaste(e) {
+    const clip = e.clipboardData || window.clipboardData;
+    if (!clip || !chatInput) return;
+
+    const plain = normalizeLineBreaks(clip.getData('text/plain') || '');
+    let insert = plain;
+    if (!/\n/.test(plain)) {
+        const fromHtml = normalizeLineBreaks(clipboardHtmlToText(clip.getData('text/html') || ''));
+        insert = /\n/.test(fromHtml) ? fromHtml : restoreLostLineBreaks(plain);
+    }
+    insert = insert.replace(/\n[ \t]+/g, '\n').trim();
+    if (!insert) return;
+
+    e.preventDefault();
+    const start = chatInput.selectionStart ?? chatInput.value.length;
+    const end = chatInput.selectionEnd ?? chatInput.value.length;
+    const before = chatInput.value.slice(0, start);
+    const after = chatInput.value.slice(end);
+    const room = Math.max(0, MAX_CHAT_MESSAGE_CHARS - (before.length + after.length));
+    const chunk = insert.slice(0, room);
+
+    chatInput.value = before + chunk + after;
+    const caret = start + chunk.length;
+    chatInput.setSelectionRange(caret, caret);
+    autoGrowChatInput();
+    refreshSendButtonState();
+
+    if (chunk.length < insert.length) {
+        showToast(
+            uiText('messageTooLong', {
+                fallback: `Message is too long. Max ${MAX_CHAT_MESSAGE_CHARS} characters.`
+            }),
+            'info',
+            { dedupeKey: 'msg-too-long' }
+        );
+    }
+}
+
+/** Составное задание — theory.js закрывает только первый распознанный шаблон; нужна полная генерация моделью. */
+function isCompositeBuildQuery(query) {
+    const t = normalizeQueryForAnalysis(query).toLowerCase().replace(/ё/g, 'е');
+    if (!t) return false;
+
+    if (countRequestedParts(query) >= 2) return true;
+
+    if (/комплексн|complex\s*(?:exercise|task|assignment)/i.test(t)) return true;
+    if (/следующие\s+шаг|following\s+steps|выполни\s+(?:следующ|шаг)/i.test(t)) return true;
+
+    if (/энгармон|enharmon/i.test(t)) return true;
+
+    if (/(?:две|two|обе|both|разн[а-яё]*)\s*(?:разн[а-яё]*\s*)?(?:тональност|tonalit|keys?|лад[а-яё]*|modes?)/i.test(t)) return true;
+    if (/в\s+маjor(?:е|у|ную)?\s+и\s+в\s+минor|in\s+major\s+and\s+in\s+minor|major\s+and\s+minor|маjor\s+и\s+минor|минor\s+и\s+маjor/i.test(t)) return true;
+
+    const fromSpecificNote = /(?:от|from)\s+(?:нот[ыаue]|note)?\s*[#♯a-gа-яё]|фа[\s-]*диез|f\s*#|f\s*sharp|соль[\s-]*бемоль|g\s*flat/i.test(t);
+    const wantsResolution = /разреш|resolution|resolv/i.test(t);
+    const wantsBuild = /построй|постро|сделай|build|construct|make\b|create\b|draw|show/i.test(t);
+    const wantsWrite = /напиши|выведи|write|list|состав/i.test(t);
+
+    if (fromSpecificNote && (wantsResolution || /замен|replac|энгармон|enharmon/i.test(t))) return true;
+    if (fromSpecificNote && wantsBuild && /(?:,\s*|\s+и\s+|\s+а\s+также\s+)/.test(t)) return true;
+
+    const functionChords = (t.match(/\b[tspd][3465]{2}\b|\b[псд]\s*5\s*3\b|\b[псд]\s*4\s*3\b|\b[псд]\s*6\s*5\b/gi) || []).length;
+    if (functionChords >= 2) return true;
+    if (/звуков[а-яё]*\s+состав/i.test(t) && (wantsBuild || /тритон|tritone|аккорд|chord/i.test(t))) return true;
+    if (wantsWrite && wantsBuild) return true;
+    if (/выбери|choose|select/i.test(t) && (wantsWrite || wantsBuild)) return true;
+
+    const exerciseTypes = [
+        /тритон|tritone/i.test(t),
+        /характерн|characteristic/i.test(t),
+        /(?:^|[^a-zа-яё])d\s*7|dominant\s*7|д\s*7/i.test(t),
+        /цепочк|chain/i.test(t),
+        /(?:^|[^a-zа-яё])гамм|scale|звукоряд/i.test(t) && !/тритон|tritone/i.test(t),
+        /аккорд|chord|трезвуч|triad|t53|s53|d53/i.test(t),
+        /энгармон|enharmon/i.test(t),
+        /модуляц|modulat/i.test(t),
+    ].filter(Boolean).length;
+    if (exerciseTypes >= 2) return true;
+
+    if (/\b[1-3][\.)]\s/.test(t) && /\b[2-9][\.)]\s/.test(t)) return true;
+
+    const clauseMarkers = (t.match(/\b(?:и|а\s+также|also|then|затем|плюс)\b|,\s*и\s+/g) || []).length;
+    if (clauseMarkers >= 2 && (wantsBuild || wantsResolution || wantsWrite)) return true;
+
+    if (wantsResolution && /(?:две|two|обе|both|разн[а-яё]*)\s*(?:тональност|лад|mode|key|context)/i.test(t)) return true;
+
+    if (/ум\.?\s*5|уменьш[а-яё]*\s*квинт|diminished\s*fifth|ym/i.test(t) && fromSpecificNote && wantsResolution) return true;
+
+    return false;
+}
+
+/** Сколько [[NOTATION:...]] блоков в тексте. */
+function countNotationBlocks(text) {
+    return (String(text || '').match(/\[\[NOTATION:/g) || []).length;
+}
+
+/** Запрос полностью закрывается theory.js — модель не нужна (нет галлюцинаций в нотации). */
+function canAnswerFromTheoryOnly(userQuery, { harmonizationTask, hasImage } = {}) {
+    if (harmonizationTask || hasImage) return false;
+    if (isCompositeBuildQuery(userQuery) || isMultiTopicQuery(userQuery)) return false;
+    if (!notationModeEnabled || !window.SolfTheory?.buildNotationForQuery) return false;
+    if (!isBuildTask(userQuery) && !isChainTask(userQuery)) return false;
+    const det = queryTheoryNotation(userQuery);
+    if (!det?.blockString) return false;
+    return true;
+}
+
+function buildNotationUserReminder(responseLang, { multiPart = 0 } = {}) {
+    const langName = { en: 'English', ru: 'Russian', de: 'German', es: 'Spanish', zh: 'Chinese', ja: 'Japanese' }[responseLang] || 'the user\'s language';
+
+    // При многосоставном задании «коротко и один блок» вредит: модель закрывает первый
+    // пункт и останавливается. Тогда лимит длины снимаем и требуем блок на каждый пункт.
+    const lengthRule = multiPart >= 2
+        ? `LENGTH: this request has ${multiPart} parts — cover ALL of them. Keep each part tight (1–3 sentences), but never drop a part to stay short. Short heading per part is allowed. `
+        : 'KEEP TEXT VERY SHORT: 1–2 sentences (≤30 words) for normal questions, up to 4–6 short sentences only for genuinely hard tasks (harmonization, voice leading, modulation, dictation, counterpoint). No headings, no recap, no fluff. ';
+    const blockRule = multiPart >= 2
+        ? `BLOCKS: emit ONE [[NOTATION:{...}]] block per part that needs notes (${multiPart} parts → up to ${multiPart} blocks), each placed right after that part's text. Never wrap blocks in code fences. `
+        : 'End the message with a valid [[NOTATION:{...}]] block as the FINAL line. Default = ONE small block (1–2 measures). HARMONIZATION / image exercise = long block (one SATB chord per measure for the whole piece). Use multiple blocks only for hard tasks. Never wrap blocks in code fences. ';
+
+    return '\n\n[NOTATION MODE — silent reminder, never quote this text]\n' +
+        `LANGUAGE: reply in ${langName} only — match the user, NOT the Russian theory examples in the system prompt.\n` +
+        lengthRule +
+        blockRule +
+        'JSON PRIORITY: a complete closed JSON block matters more than long prose — shorten TEXT, never truncate JSON. Block must end with ]}]]. ' +
+        'TASK COMPLIANCE: do EXACTLY what the user asked in THIS message — full set, every part, and NOTHING beyond it. Never substitute a broader table (e.g. "all seventh chord types") for the one chord that was requested. Ignore earlier chat mistakes. Dominant labels: D7, D6/5, D4/3, D2 (Latin only). ' +
+        'EXERCISE COMPLETENESS: "tritones in key X" (without "natural") = HARMONIC form = 2 pairs = 8 sonorities, barAfter after each resolved pair. "Natural tritones" = 1 pair = 4 sonorities. "Both pairs" / "two pairs" = ALWAYS 8 sonorities. "Characteristic intervals" = ALL 4 pairs (8 sonorities). "Inversions" / "all types" = full set, not one example. "D7 + inversions + resolutions" = 8 chords (4 D7 forms + 4 tonic resolutions). Melodic scale = ascending AND descending when requested. Scales and single chords — barlines:"none" without timeSignature. Chain / цепочка = FULL Chain 1 (9 chords) or Chain 2 (11 chords) per key mode — but if the task itself lists a chord sequence, build EXACTLY that list instead; barlines:"none"; label on EVERY chord; never a 1–3 chord demo. ' +
+        'TRITONE RESOLUTIONS: aug4 → SIXTH (m6/M6, 8–9 semitones), dim5 → THIRD (m3/M3, 3–4 semitones). NEVER resolve a tritone to a fourth or fifth. ' +
+        'CHARACTERISTIC aug2 in harmonic MAJOR: ONLY degree VI is lowered (bVI); degree VII stays NATURAL — e.g. F major: db/4+e/4 (NOT eb/4). D♭–E♭ is a major 2nd (WRONG); D♭–E is augmented 2nd (3 semitones, CORRECT).';
+}
+
+/** Жёсткий повторный промпт, если первый ответ всё-таки пришёл без блока. */
+const NOTATION_RETRY_PROMPT =
+    'NOTATION MODE: your last answer was INVALID — no [[NOTATION:{...}]] line. Rewrite: same meaning and the USER\'S language, SHORT (2–5 sentences), and end with exactly ONE valid [[NOTATION:{"clef":"...","keySignature":"...","timeSignature":"...","notes":[...]}]] block. Nothing after the block. No markdown.';
+
+/** Второй ретрай — ещё короче инструкция, максимально прямой императив. */
+const NOTATION_RETRY_PROMPT_2 =
+    'STILL WRONG: no [[NOTATION:...]] line. Output format: (1) 1–3 short sentences in the user’s language, (2) newline, (3) single line [[NOTATION:{valid JSON as in system rules}]]. Nothing else. No preamble about rules.';
+
+/**
+ * Третий ретрай — для случая «JSON обрезался». Просим ТОЛЬКО блок без какой-либо прозы:
+ * это гарантированно влезает в любой токен-лимит и закрывается на `]}]]`.
+ */
+const NOTATION_RETRY_PROMPT_3 =
+    'Your JSON block was TRUNCATED (missing closing ]}]]). Output EXACTLY one complete valid [[NOTATION:{...}]] block and NOTHING else — no words before or after, no markdown. Close with ]}]] on the same line.';
+
+const HARMONIZATION_RETRY_PROMPT =
+    'HARMONIZATION INCOMPLETE or WRONG FORMAT. Read the image again. Output ONE [[NOTATION:{...}]] with "layout":"satb": treble clef staff = soprano (given melody!) + alto; BASS clef staff = tenor + bass; "chords"[] = one entry per measure with fields soprano, alto, tenor, bass, duration, label. ALL measures of the exercise — not one demo chord. keySignature from the image (count sharps/flats). No prose — only the block.';
+
+const CHAIN_RETRY_PROMPT =
+    'CHAIN INCOMPLETE or WRONG ORDER. Output ONE [[NOTATION:{...}]] with barlines:"none", clef:"treble", and notes[] = EVERY chord of the full chain in exact schema order, each with duration and label. Major = Chain 1 (9 chords: T53 S64 VII7 D65 T53 S6 K64 D7 T53). Minor = Chain 2 (11 chords: t53 d6 s6 D53 D2 t6 II7 D43 t53 s64 t53). No prose — only the block.';
+
+function hasNotationBlock(text) {
+    return /\[\[NOTATION:\s*\{[\s\S]*?\}\s*\]\]/.test(String(text || ''));
+}
+
+/**
+ * Сценарий «модель начала блок [[NOTATION:..., но не успела дописать `]}]]`».
+ * Так бывает при коротком max_tokens на стороне Gemini/воркера, особенно для
+ * длинных упражнений (характерные интервалы, обе пары тритонов, обращения).
+ * Возвращает true только если ОТКРЫЛСЯ блок, а валидного целого блока нет.
+ */
+function hasTruncatedNotationStart(text) {
+    const s = String(text || '');
+    if (hasNotationBlock(s)) return false;
+    return /\[\[NOTATION:/.test(s);
+}
+
+/** Срезает «оборванный» хвост `[[NOTATION:...` (если он действительно обрезан, а не валиден). */
+function stripTruncatedNotationTail(text) {
+    const s = String(text || '');
+    if (hasNotationBlock(s)) return s;
+    return s.replace(/\[\[NOTATION:[\s\S]*$/, '').trimEnd();
+}
+
+/**
+ * Распознаёт «большие» задачи, которым нужен увеличенный бюджет токенов (до 8192),
+ * иначе длинный нотный блок обрежется на середине. Это цепочки аккордов, гармонизации,
+ * диктанты, модуляции, секвенции, 4-голосие, а также любые просьбы с явным большим
+ * числом тактов/аккордов/строк («15 аккордов», «на 8 тактов», «длинную цепочку»).
+ */
+/** Запрос на построение (интервалы, гаммы, аккорды, цепочки…) — для «прочистки памяти» в истории чата. */
+function isBuildTask(query) {
+    const t = String(query || '').toLowerCase().replace(/ё/g, 'е');
+    if (!t) return false;
+    if (/гармониз[уиао]|harmoniz|harmoni[sz]e|спиш[иь]\s*голос|4[\s-]?голос|четырех\s*голос|четырёх\s*голос|satb|голосоведени/i.test(t)) return true;
+    if (/t53\s*[-–—,]/i.test(t)) return true;
+    if (/(?:тритон|tritone)/i.test(t) && /(?:д7|d7|цепоч|t53)/i.test(t)) return true;
+    if (/характерн|х\.\s*и\.|characteristic/i.test(t)) return true;
+    if (/мелодическ[а-яё]*\s*гамм|гамм[а-яё]*\s*мелодическ|построй\s*гамм|build\s*scale|все\s*виды\s*гамм/i.test(t)) return true;
+    if (/хроматическ|chromatic/i.test(t) && /гамм|scale|звукоряд|(?:от|from)\s+/i.test(t)) return true;
+    if (/главн[а-яё]*\s*трезвуч|main\s*triads?/i.test(t)) return true;
+    const buildVerb = /построй|постро|построи|сделай|напиши|выведи|нарисуй|покажи|build|draw|show|write|construct|make\b|create\b|harmoniz/i;
+    const buildNoun = /тритон|характерн[а-яё]*\s*интервал|ув\.?\s*[2457]|ум\.?\s*[47]|увеличенн[а-яё]*\s*(?:секунд|квинт|квар)|уменьшенн[а-яё]*\s*(?:септим|кварт)|гамм|звукоряд|трезвуч|аккорд|интервал|секунд|терци|кварт|квинт|септим|цепочк|задач|упражнен|мелоди|cadence|scale|triad|chord|interval|tritone|inversion|resolution|dominant|sept|exercise|melody|\bmaj7\b|\bdim7\b|\bm7b5\b|\baug7\b|\bmm7\b/i;
+    if (buildVerb.test(t) && buildNoun.test(t)) return true;
+    // Школьные интервалы: ч1 м2 б2 м3 б3 ч4 ч5 м6 б6 м7 б7 ч8 (+ ув/ум) от ноты — быстрый ответ движка
+    const schoolInterval = /(?:^|[^а-яёa-z])(?:ч|б|м|ув|ум)\.?\s*[1-8](?![0-9/])/i;
+    const enInterval = /(?:^|[^a-zа-яё])(?:p|m|a|d)\s*[1-8](?![0-9/])/i;
+    if ((schoolInterval.test(t) || enInterval.test(t)) && (buildVerb.test(t) || /(?:от|from)\s+/i.test(t))) return true;
+    if (/\b(maj7|dim7|m7b5|aug7|mm7)\b/i.test(t) && /(?:от|from)\s+/i.test(t)) return true;
+    if (/\bd\s*7\b|dominant\s*7|доминант[а-яё]*\s*септ|(?:^|[^а-яё])д\s*7(?![0-9])/i.test(t) && buildVerb.test(t)) return true;
+    if (/^d7\b|^\s*d7[\s,]/i.test(t.trim())) return true;
+    return false;
+}
+
+/**
+ * Гармонизация мелодии/упражнения (часто с картинкой).
+ * «гармониз[уиао]», а не «гармониз»: иначе слово «Энгармонизм» из задания по
+ * энгармонической замене принималось за просьбу гармонизовать мелодию.
+ */
+function isHarmonizationTask(query, hasImage = false) {
+    const t = String(query || '').toLowerCase().replace(/ё/g, 'е');
+    if (/гармониз[уиао]|harmoniz|harmoni[sz]e|спиш[иь]\s*голос|4[\s-]?голос|четырех\s*голос|четырёх\s*голос|satb|s\.?a\.?t\.?b|voice\s*leading|голосоведени/i.test(t)) return true;
+    if (hasImage && /задач|упражнен|мелоди|эту|этот|это|фото|картин|example|exercise|this|analyze|анализ|разбер/i.test(t)) return true;
+    return false;
+}
+
+/**
+ * Задача уровня курса гармонии (училище/консерватория): четырёхголосие, цифрованный бас,
+ * каденции, K64, двойная доминанта, неаполитанский, модуляция, гармонический анализ.
+ * Шире, чем isHarmonizationTask: сюда попадают и текстовые вопросы без нотации.
+ */
+function isHarmonyCourseTask(query) {
+    const t = String(query || '').toLowerCase().replace(/ё/g, 'е');
+    if (!t) return false;
+    if (isHarmonizationTask(t)) return true;
+    // Сами по себе означают задание курса гармонии.
+    if (/цифрованн[а-яё]*\s*бас|бас\s*с\s*цифр|генерал[\s-]?бас|figured\s*bass|задач[а-яё]*\s*по\s*гармони|гармоническ[а-яё]*\s*задач|part[\s-]?writing/i.test(t)) return true;
+    // Термины гармонии дают чек-лист только вместе с просьбой что-то построить или решить:
+    // «что такое каданс» — обычный вопрос, а не задача.
+    const term = /каданс|кадансов|каденци|cadence|k\s*64|прерванн[а-яё]*\s*оборот|плагальн|автентич|двойн[а-яё]*\s*доминант|неаполитанск|увеличенн[а-яё]*\s*секст|augmented\s*sixth|neapolitan|модуляц|отклонен|modulat|посредств[а-яё]*\s*аккорд|pivot\s*chord|переченье|перекрещиван|соедин[а-яё]*\s*(?:аккорд|трезвуч)|(?:гармоническ|мелодическ)[а-яё]*\s*(?:соединен|способ)|удвоен|скрыт[а-яё]*\s*(?:квинт|октав)|параллельн[а-яё]*\s*(?:квинт|октав)|parallel\s*(?:fifth|octave)|гармоническ[а-яё]*\s*анализ|harmonic\s*analysis/i;
+    const taskVerb = /построй|постро|сделай|напиши|выведи|нарисуй|реши|решить|разбер|проанализир|соедини|заверши|дострой|заполни|исправ|провер|build|write|construct|solve|realize|analy[sz]e|complete|connect|correct|check/i;
+    return term.test(t) && taskVerb.test(t);
+}
+
+/** Компактный чек-лист гармонии в user-турн: правила из системного промпта модель забывает чаще, чем требование в самом задании. */
+function buildHarmonyRulesReminder(lang) {
+    if (lang === 'ru') {
+        return '\n\n[ПРАВИЛА ГАРМОНИИ — проверь перед ответом]\n' +
+            'Удвоения: 53 — прима; 6 — прима или квинта (в уменьшённом — бас); 64 — всегда бас. Септаккорд — 4 разных тона (кроме неполного D7).\n' +
+            'Соединение: кварто-квинтовое — общий тон в том же голосе; секундовое — все три верхних голоса ПРОТИВОПОЛОЖНО басу; терцовое — два общих тона на месте.\n' +
+            'Запрещено: параллельные ч5/ч8/унисоны в любой из 6 пар голосов; скрытые квинты/октавы между басом и сопрано при скачке в сопрано; переченье; ходы на ув.2, ув.4, ув.5 (в миноре VI→VII#); перекрещивание; D→S.\n' +
+            'Обязательно: вводный тон вверх в I, септима вниз на секунду, альтерация по направлению; K64 на сильной доле с удвоенным басом; заключительная каденция совершенная.\n' +
+            'Прогони каждый такт по этому списку и перепиши нарушения ДО вывода ответа.';
+    }
+    return '\n\n[HARMONY RULES — verify before answering]\n' +
+        'Doubling: root position — double the root; first inversion — root or fifth (diminished — double the bass); six-four — always double the bass. Seventh chords keep 4 distinct tones (except incomplete V7).\n' +
+        'Connection: fifth/fourth relation — keep the common tone in the same voice; second relation — all three upper voices move OPPOSITE to the bass; third relation — keep both common tones.\n' +
+        'Forbidden: parallel perfect fifths/octaves/unisons in any of the 6 voice pairs; hidden fifths/octaves between bass and soprano when soprano leaps; cross relation; melodic augmented intervals (A2, A4, A5); voice crossing; V→IV.\n' +
+        'Required: leading tone up to 1, every seventh down by step, altered tones follow their alteration; cadential six-four on a strong beat with doubled bass; final cadence perfect authentic.\n' +
+        'Check every measure against this list and rewrite violations BEFORE answering.';
+}
+
+/** Запрос на цепочку аккордов (Chain 1 / Chain 2). */
+function isChainTask(query) {
+    const t = String(query || '').toLowerCase().replace(/ё/g, 'е');
+    return /цепочк|chain|chord\s*chain|аккордн[а-яё]*\s*цепоч/i.test(t);
+}
+
+/** Ожидаемое число аккордов: Chain 1 = 9, Chain 2 = 11. */
+const CHORD_LABEL_RE = /^(?:DD)?(?:VII|VI|IV|III|II|[NKTSDtsd])(?:53|64|65|43|42|7|6|2)?$/;
+
+/**
+ * Цепочка, выписанная в самом задании (t53 → VI53 → s6 → DDVII7 → K64 → D7 …).
+ * Такую строим ровно как задано: подмена её типовой Цепочкой 1/2 — грубая ошибка,
+ * а обещание «система подставит эталонные ноты» заставляло модель вообще не писать ноты.
+ */
+function extractExplicitChordChain(query) {
+    for (const row of String(query || '').split('\n')) {
+        if (!/(?:→|⟶|->|=>)/.test(row)) continue;
+        const labels = row
+            .split(/\s*(?:→|⟶|->|=>)\s*/)
+            .map(token => {
+                const head = token.trim().replace(/^[[(]+/, '').split(/[\s([,.]/)[0].replace(/[.,;:]+$/, '');
+                return CHORD_LABEL_RE.test(head) ? head : null;
+            })
+            .filter(Boolean);
+        if (labels.length >= 3) return labels;
+    }
+    return null;
+}
+
+function expectedChainLength(query) {
+    const explicit = extractExplicitChordChain(query);
+    if (explicit) return explicit.length;
+    const q = String(query || '');
+    if (isChain2Query(q) || (CHAIN_MINOR_RE.test(q) && !isChain1ExplicitQuery(q))) return 11;
+    return 9;
+}
+
+function buildChainReminder(lang, query) {
+    const explicit = extractExplicitChordChain(query);
+    if (explicit) {
+        const schema = explicit.join(' – ');
+        if (lang === 'ru') {
+            return '\n\n[ЦЕПОЧКА ИЗ ЗАДАНИЯ — обязательно]\n' +
+                `Строй ИМЕННО эту последовательность, все ${explicit.length} аккордов подряд:\n${schema}\n` +
+                'Это НЕ типовая Цепочка 1/2 — не подменяй её и не сокращай. barlines:"none", timeSignature:"", label на КАЖДЫЙ аккорд. Ноты выписывай сам: эталона для такой цепочки нет.';
+        }
+        return '\n\n[CHAIN FROM THE TASK — mandatory]\n' +
+            `Build EXACTLY this sequence, all ${explicit.length} chords in order:\n${schema}\n` +
+            'This is NOT the standard Chain 1/2 — never substitute or shorten it. barlines:"none", timeSignature:"", label every chord. Write the notes yourself: there is no reference block for this chain.';
+    }
+    const len = expectedChainLength(query);
+    const chain2 = len === 11;
+    const schema = chain2 ? CHAIN2_LABELS : CHAIN1_LABELS;
+    if (lang === 'ru') {
+        return '\n\n[ЦЕПОЧКА — обязательно]\n' +
+            `Цепочка ${chain2 ? 2 : 1}: ровно ${len} аккордов подряд в порядке:\n${schema}\n` +
+            'barlines:"none", timeSignature:"", label на КАЖДЫЙ аккорд. НЕ 1–3 аккорда «для примера». Система подставит эталонные ноты — не выдумывай свои.';
+    }
+    return '\n\n[CHAIN — mandatory]\n' +
+        `Chain ${chain2 ? 2 : 1}: exactly ${len} chords in order:\n${schema}\n` +
+        'barlines:"none", timeSignature:"", label every chord. NOT a 1–3 chord demo. System will inject reference notes — do not invent your own.';
+}
+
+function countNotationChords(text) {
+    const match = String(text || '').match(/\[\[NOTATION:\s*(\{[\s\S]*?\})\s*\]\]/);
+    if (!match) return 0;
+    try {
+        const data = normalizeNotationLayout(JSON.parse(match[1]));
+        if (data.layout === 'satb' && Array.isArray(data.chords)) return data.chords.length;
+        const notes = Array.isArray(data.notes) ? data.notes : [];
+        return notes.filter(n => Array.isArray(n.keys) && n.keys.length >= 3).length;
+    } catch (_) {
+        return 0;
+    }
+}
+
+function buildHarmonizationReminder(lang, hasImage) {
+    const ru = lang === 'ru';
+    if (ru) {
+        return '\n\n[ГАРМОНИЗАЦИЯ — обязательно]\n' +
+            (hasImage ? 'Прочитай ВСЮ мелодию с приложенного изображения. Тональность — по знакам при ключе (пересчитай диезы/бемоли).\n' : '') +
+            'Формат: "layout":"satb" — верхний стан (скрипичный ключ): soprano=данная мелодия + alto; нижний стан (БАСОВЫЙ ключ): tenor + bass.\n' +
+            'chords[] — по одному аккорду на такт на всё упражнение. label — функция (T53, S6, D7…). НЕ один демо-аккорд.\n' +
+            'Проверь голосоведение: без параллельных квинт/октав; мелодия в soprano совпадает с картинкой.';
+    }
+    return '\n\n[HARMONIZATION — mandatory]\n' +
+        (hasImage ? 'Read the ENTIRE melody from the attached image. Key signature — count sharps/flats on the image.\n' : '') +
+        'Format: "layout":"satb" — upper staff (treble): soprano=given melody + alto; lower staff (BASS clef): tenor + bass.\n' +
+        'chords[] — one chord per measure for the full exercise. label every chord. NOT a single demo chord.\n' +
+        'Voice-leading rules apply; soprano must match the image melody.';
+}
+
+/** Для build-задач: краткий императив «сброса памяти» — модель не должна копировать старые ошибки. */
+function buildFreshTaskReminder(query, lang) {
+    const q = String(query || '').trim();
+    const ru = lang === 'ru';
+    const parts = [];
+    if (/обращени|inversion/i.test(q) && /разрешени|resolution|resolv/i.test(q)) {
+        parts.push(ru
+            ? 'ОБЯЗАТЕЛЬНО: все обращения И все разрешения (полный комплект пар D7→T).'
+            : 'MANDATORY: ALL inversions AND ALL resolutions (full D7→T pairs).');
+    } else if (/обращени|inversion/i.test(q)) {
+        parts.push(ru ? 'ОБЯЗАТЕЛЬНО: все обращения, не только основной вид.' : 'MANDATORY: ALL inversions, not root position only.');
+    } else if (/разрешени|resolution|resolv/i.test(q)) {
+        parts.push(ru ? 'ОБЯЗАТЕЛЬНО: каждое созвучие с разрешением.' : 'MANDATORY: every sonority with its resolution.');
+    }
+    if (/мелодическ|melodic/i.test(q) && /вверх|вниз|up|down|both\s*way|ascending|descending/i.test(q)) {
+        parts.push(ru
+            ? 'ОБЯЗАТЕЛЬНО: мелодическая гамма — и вверх, и вниз в одном блоке (15 нот).'
+            : 'MANDATORY: melodic scale — ascending AND descending in one block (15 notes).');
+    }
+    if (/все|all\b|обе\s*пары|both\s*pairs|две\s*пары|two\s*pairs/i.test(q) && /тритон|tritone/i.test(q)) {
+        parts.push(ru ? 'ОБЯЗАТЕЛЬНО: обе пары тритонов с разрешениями (8 созвучий).' : 'MANDATORY: BOTH tritone pairs with resolutions (8 sonorities).');
+    }
+    if (/характерн|characteristic/i.test(q)) {
+        parts.push(ru ? 'ОБЯЗАТЕЛЬНО: все 4 характерных интервала с разрешениями (8 созвучий).' : 'MANDATORY: ALL 4 characteristic intervals with resolutions (8 sonorities).');
+    }
+    if (/ув\.?\s*2|aug\.?\s*2|\bA2\b/i.test(q) && /маjor|dur|маж/i.test(q)) {
+        parts.push(ru
+            ? 'ОБЯЗАТЕЛЬНО: ув.2 в мажоре = bVI→VII; VII бекар (F-dur: db/4+e/4, НЕ eb/4).'
+            : 'MANDATORY: aug2 in major = bVI→VII; VII natural (F major: db/4+e/4, NOT eb/4).');
+    }
+    if (/гармониз[уиао]|harmoniz|harmoni[sz]e|satb|4[\s-]?голос|четырех\s*голос|четырёх\s*голос/i.test(q)) {
+        parts.push(ru
+            ? 'ОБЯЗАТЕЛЬНО: полная гармонизация SATB — аккорд на КАЖДЫЙ такт всего упражнения, не один пример.'
+            : 'MANDATORY: FULL SATB harmonization — one chord per measure for the entire exercise, not a demo chord.');
+    }
+    if (/цепочк|chain/i.test(q)) {
+        const len = expectedChainLength(q);
+        parts.push(ru
+            ? `ОБЯЗАТЕЛЬНО: полная цепочка — ровно ${len} аккордов подряд, все labels по схеме, barlines:"none".`
+            : `MANDATORY: FULL chain — exactly ${len} chords in sequence with correct labels, barlines:"none".`);
+    }
+    if (isCompositeBuildQuery(q)) {
+        parts.push(ru
+            ? 'ОБЯЗАТЕЛЬНО: выполни ВСЕ части задания в одном ответе — каждый шаг, каждый аккорд (T53, S53, D53…), каждое построение и каждое разрешение. Используй несколько [[NOTATION:...]] блоков при необходимости. Не отвечай только на первый фрагмент (например, только тритоны).'
+            : 'MANDATORY: complete EVERY part in one answer — each step, each chord (T53, S53, D53…), each construction and each resolution. Use multiple [[NOTATION:...]] blocks if needed. Do NOT answer only the first fragment (e.g. tritones only).');
+    }
+    if (/энгармон|enharmon/i.test(q)) {
+        parts.push(ru
+            ? 'ОБЯЗАТЕЛЬНО: покажи энгармоническую замену (эквивалентное написание/созвучие) явно в нотации.'
+            : 'MANDATORY: show the enharmonic replacement explicitly in notation.');
+    }
+    if (/разреш/i.test(q) && /(?:две|two|обе|both|разн[а-яё]*)\s*(?:тональност|лад|mode|key)/i.test(q)) {
+        parts.push(ru
+            ? 'ОБЯЗАТЕЛЬНО: разрешения в КАЖДОЙ указанной тональности/ладе (напр. мажор И минор), не только в одной.'
+            : 'MANDATORY: resolutions in EACH requested key/mode (e.g. major AND minor), not just one.');
+    }
+    const header = ru
+        ? '[СВЕЖЕЕ ЗАДАНИЕ — игнорируй предыдущие ответы в чате; выполни ТОЛЬКО текущий запрос по правилам системы]'
+        : '[FRESH TASK — ignore earlier chat replies; follow system rules for THIS request only]';
+    return parts.length ? `\n\n${header}\n${parts.join('\n')}` : `\n\n${header}`;
+}
+
+/**
+ * Сколько отдельных подзаданий просит пользователь.
+ * Считаем пункты нумерованного списка, а если списка нет — отдельные предложения-императивы
+ * («постройте …», «напишите …», «расшифруйте …»). Нужно, чтобы модель не отвечала
+ * на первый пункт и не останавливалась.
+ */
+function countRequestedParts(query) {
+    const text = normalizeQueryForAnalysis(query);
+    if (!text) return 0;
+
+    const numbered = text.match(/(?:^|\n)\s*\d{1,2}[.)]\s+\S/g) || [];
+    if (numbered.length >= 2) return numbered.length;
+
+    const bulleted = text.match(/(?:^|\n)\s*[-—•*]\s+\S/g) || [];
+    if (bulleted.length >= 2) return bulleted.length;
+
+    const IMPERATIVE_RE = /(?:^|[\n.;:!?]\s*)(?:построй|постро|запиши|напиши|расшифруй|разреши|определи|назови|укажи|сделай|выведи|перечисли|build|construct|write|list|name|identify|resolve|spell|show)[а-яёa-z]*/gi;
+    const imperatives = text.match(IMPERATIVE_RE) || [];
+    return imperatives.length;
+}
+
+/** Запрос с несколькими темами/подзадачами — не быстрый ответ, нужен полный ответ модели. */
+function isMultiTopicQuery(query) {
+    const t = normalizeQueryForAnalysis(query).toLowerCase().replace(/ё/g, 'е');
+    if (!t || t.length < 20) return false;
+    if (countRequestedParts(query) >= 2) return true;
+    if ((t.match(/\?/g) || []).length >= 2) return true;
+    if (/комплексн|следующие\s+шаг|выполни\s+(?:следующ|шаг)/i.test(t)) return true;
+
+    const actionRe = /(?:построй|постро|сделай|напиши|выведи|нарисуй|покажи|объясни|расскажи|опиши|разбери|определи|выбери|build|draw|write|explain|describe|show|construct|identify|analyze|harmoniz|гармониз[уиао]|choose|select)/gi;
+    const actions = t.match(actionRe);
+    if (actions && new Set(actions.map(a => a.toLowerCase())).size >= 2) return true;
+
+    const multiPartSep = /(?:\s+и\s+|\s+and\s+|\s+also\s+|\s+плюс\s+|\s+а\s+также\s+|\s+также\s+|\s+ещё\s+|\s+еще\s+|;\s*)/i;
+    if (t.length > 100 && multiPartSep.test(t)) return true;
+
+    return false;
+}
+
+/**
+ * Явный чек-лист для модели: перечисляем пункты задания её же словами и требуем
+ * закрыть каждый. Без этого при нескольких подзадачах Gemini отвечает только на первую.
+ */
+function buildMultiPartReminder(query, lang, partCount) {
+    const ru = lang === 'ru';
+    const text = normalizeQueryForAnalysis(query);
+    // Режем по маркерам списка, чтобы в пункт попал весь его текст, а не только заголовок.
+    const MARKER_RE = /(?:^|\n)[ \t]*(?:\d{1,2}[.)]|[-—•*])[ \t]+/;
+    const items = text
+        .split(new RegExp(`(?=${MARKER_RE.source})`))
+        .filter(chunk => MARKER_RE.test(chunk))
+        .map(chunk => chunk.replace(MARKER_RE, '').replace(/\s*\n\s*/g, ' ').trim())
+        .filter(Boolean);
+
+    const checklist = items.length >= 2
+        ? '\n' + items.map((s, i) => `${i + 1}) ${s.slice(0, 220)}`).join('\n')
+        : '';
+
+    const head = ru
+        ? `[МНОГОСОСТАВНОЕ ЗАДАНИЕ — ${partCount} пункт(а/ов). Выполни КАЖДЫЙ пункт по порядку в ОДНОМ ответе]`
+        : `[MULTI-PART TASK — ${partCount} parts. Complete EVERY part, in order, in ONE answer]`;
+
+    const rules = ru
+        ? [
+            'Ни один пункт не пропускать и не объединять: у каждого свой заголовок и свой ответ.',
+            'Для каждого пункта, где нужны ноты, — отдельный [[NOTATION:{...}]] блок сразу после текста этого пункта.',
+            'Ничего лишнего: не добавляй аккорды, интервалы и тональности, которых нет в задании.',
+            'Если пункт просит только названия нот — напиши названия, не подменяй его другим упражнением.'
+        ]
+        : [
+            'Do not skip or merge parts: each gets its own heading and its own answer.',
+            'For every part that needs notes — a separate [[NOTATION:{...}]] block right after that part\'s text.',
+            'Nothing extra: do not add chords, intervals or keys that were not requested.',
+            'If a part asks only for note names — give note names, do not swap in a different exercise.'
+        ];
+
+    return `\n\n${head}${checklist}\n${rules.join('\n')}`;
+}
+
+function isBigNotationTask(query) {
+    const t = String(query || '').toLowerCase();
+    if (!t) return false;
+    if (isCompositeBuildQuery(query)) return true;
+
+    // Явные ключевые слова «больших» заданий.
+    const bigKeywords = /цепочк|прогресс|последовательн|гармониз|гармонизаци|голосоведени|четырёхголос|четырехголос|4-?голос|4\s*голос|s\.?a\.?t\.?b|сопрано.*альт|диктант|модуляц|секвенц|период|каданс|кадансов|оборот|развит|соедин(и|е)ни|harmoniz|harmoni[sz]e|progression|chord\s*chain|voice[- ]?leading|four[- ]?part|four\s*voices|satb|dictation|modulat|sequence|cadence|counterpoint|контрапункт/;
+    if (bigKeywords.test(t)) return true;
+
+    // Явно указано большое количество (аккордов/тактов/строк/ступеней и т.п.).
+    const numMatch = t.match(/(\d{1,3})\s*(аккорд|такт|строч|строк|ступен|созвуч|нот[аы]?|chords?|bars?|measures?|lines?|notes?)/);
+    if (numMatch && parseInt(numMatch[1], 10) >= 6) return true;
+
+    // «Длинная / большая» цепочка/пример без числа.
+    if (/(длинн|больш|развёрнут|развернут|подробн|long|large|full)[а-яёa-z]*\s+(цепочк|пример|прогресс|гармониз|задани|progression|example|harmoniz)/.test(t)) return true;
+
+    return false;
+}
+const PLAN_ICONS = {
+    free: '<svg class="svg-icon" viewBox="0 0 24 24"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>',
+    basic: '<svg class="svg-icon" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>',
+    pro: '<svg class="svg-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14H11L10 22L20 10H12L13 2Z"/></svg>',
+    unlimited: '<svg class="svg-icon" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon></svg>'
+};
+
+let currentPlan = { type: "free", emoji: PLAN_ICONS.free, name: "Free" };
+
+function isRequestsExhausted() {
+    const limit = PLAN_LIMITS[currentPlan?.type || 'free']?.requests;
+    return limit !== Infinity && getRemainingRequests() <= 0;
+}
+
+let __lastNoRequestsToastAt = 0;
+function showNoRequestsToast() {
+    const now = Date.now();
+    if (now - __lastNoRequestsToastAt < 700) return;
+    __lastNoRequestsToastAt = now;
+    showToast(uiText('noRequests', { fallback: 'You have 0 requests' }), 'error', { dedupeKey: 'no-requests', dismissOnClick: true });
+}
+
+function refreshSendButtonState() {
+    if (!chatSendBtn || isGenerating) return;
+    const hasContent = (chatInput?.value?.trim?.() || '') !== '' || attachedFiles.length > 0;
+    const exhausted = isRequestsExhausted();
+    chatSendBtn.classList.toggle('is-locked', exhausted);
+    if (exhausted) {
+        // Keep button clickable so user sees a small message instead of modal.
+        chatSendBtn.disabled = false;
+        return;
+    }
+    chatSendBtn.disabled = !hasContent;
+}
+
+function closeAllOverlays(exceptElement = null) {
+    const sidebarEl = document.getElementById('sidebar');
+    const exceptInSidebar = exceptElement && sidebarEl && sidebarEl.contains(exceptElement);
+    if (!exceptInSidebar) {
+        resetSidebarExpandedMenus();
+    }
+
+    if (modeDropdown && (!exceptElement || !exceptElement.closest?.('.mode-selector-island'))) {
+        modeDropdown.classList.add('hidden');
+    }
+
+    const dropdownSelectors = ['.lang-submenu', '.lang-dropdown', '.profile-dropdown'];
+    dropdownSelectors.forEach(sel => {
+        document.querySelectorAll(sel).forEach(dropdown => {
+            const triggerButton = dropdown.previousElementSibling || dropdown.parentElement?.querySelector('button');
+            if (dropdown.contains(exceptElement) || triggerButton?.contains(exceptElement)) return;
+            dropdown.classList.remove('active');
+            dropdown.classList.remove('open');
+        });
+    });
+
+    if (isMobileLayout() && sidebar && !sidebar.classList.contains('collapsed')) {
+        const el = exceptElement;
+        const isClickInDropdown = el && dropdownSelectors.some(sel => el.closest(sel));
+        const insideSidebar = el && (sidebar.contains(el) || el.closest('#sidebar'));
+        const onToggle =
+            el &&
+            toggleSidebarBtn &&
+            (toggleSidebarBtn === el || toggleSidebarBtn.contains(el));
+        if (!insideSidebar && !onToggle && !isClickInDropdown) {
+            sidebar.classList.add('collapsed');
+            syncMobileSidebarDrawerState();
+        }
+    }
+}
+
+/** Закрытие выпадашек + сворачивание моб. drawer при тапе вне сайдбара (click и pointerdown на телефонах) */
+function handleOutsideTapDismiss(el) {
+    const wasSidebarOpen = isMobileLayout() && sidebar && !sidebar.classList.contains('collapsed');
+    closeAllOverlays(el);
+
+    if (isMobileLayout() && wasSidebarOpen && sidebar.classList.contains('collapsed')) {
+        resetSidebarExpandedMenus();
+        return;
+    }
+
+    if (isMobileLayout() && sidebar && !sidebar.classList.contains('collapsed')) {
+        const insideSidebar = el && (sidebar.contains(el) || el.closest('#sidebar'));
+        const onToggle =
+            el &&
+            toggleSidebarBtn &&
+            (toggleSidebarBtn === el || toggleSidebarBtn.contains(el));
+        if (!insideSidebar && !onToggle) {
+            sidebar.classList.add('collapsed');
+            syncMobileSidebarDrawerState();
+            resetSidebarExpandedMenus();
+        }
+    }
+}
+
+window.navigateToLogin = function () {
+    window.location.href = 'login.html';
+};
+
+// ===== УПРАВЛЕНИЕ ЧАТАМИ И ГРУППИРОВКА =====
+const TOP_VISIBLE_CHATS = 3;
+const OLDER_VISIBLE_CHATS = 5;
+const MAX_SAVED_CHATS = TOP_VISIBLE_CHATS + OLDER_VISIBLE_CHATS;
+
+function getChatsStorageKey() { return `solfai_chats_${currentUser ? currentUser.id : 'guest'}`; }
+
+function sortChatsCanonical(arr) {
+    arr.sort((a, b) => {
+        if (a.pinned && !b.pinned) return -1;
+        if (!a.pinned && b.pinned) return 1;
+        return new Date(b.createdAt || 0) - new Date(a.createdAt || 0);
+    });
+    return arr;
+}
+
+/**
+ * Trim local chats to the most recent MAX_SAVED_CHATS, and request server-side
+ * deletion of the rest, so the database doesn't grow indefinitely.
+ * Returns true if anything was trimmed.
+ */
+function enforceChatLimit() {
+    sortChatsCanonical(chats);
+    if (chats.length <= MAX_SAVED_CHATS) return false;
+
+    const removed = chats.slice(MAX_SAVED_CHATS);
+    chats = chats.slice(0, MAX_SAVED_CHATS);
+
+    if (currentUser && currentUser.id) {
+        removed.forEach(chat => {
+            if (!chat || !chat.id) return;
+            apiFetch(`${WORKER_URL}/delete-chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: chat.id, user_id: currentUser.id })
+            }).catch(err => console.warn('[Solf.ai] Failed to delete trimmed chat:', err));
+        });
+    }
+    return true;
+}
+
+function renderChatItemHTML(chat) {
+    const isActive = (typeof currentChatId !== 'undefined' && currentChatId === chat.id) ? 'active' : '';
+    const isGeneratingHere = isChatGenerating(chat.id);
+    let title = chat.title || 'New Chat';
+    if (isGeneratingHere && !isActive) title = `${title} …`;
+    const isPinned = chat.pinned ? 'is-pinned' : '';
+    const pinFill = chat.pinned ? 'currentColor' : 'none';
+
+    return `
+    <div class="chat-item ${isActive}" data-id="${chat.id}">
+        <div class="chat-title-wrapper">${title}</div>
+        <div class="chat-actions" style="${chat.pinned ? 'display: flex;' : ''}">
+            <button class="chat-action-btn pin ${isPinned}" onclick="togglePinChat('${chat.id}', event)" title="Pin">
+                <svg class="svg-icon" style="width: 14px; height: 14px; fill: ${pinFill};" viewBox="0 0 24 24"><path d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"/></svg>
+            </button>
+            <button class="chat-action-btn delete" onclick="deleteChatFromSidebar('${chat.id}', event)" title="Delete">
+                <svg class="svg-icon" style="width: 14px; height: 14px;" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
+            </button>
+        </div>
+        ${isActive && !chat.pinned ? '<div class="active-indicator"></div>' : ''}
+    </div>`;
+}
+
+window.togglePinChat = function(id, e) {
+    e.stopPropagation();
+    const chat = chats.find(c => c.id === id);
+    if (!chat) return;
+    chat.pinned = !chat.pinned;
+    chat.updatedAt = new Date().toISOString();
+    saveChatToStorage();
+    saveChatToServer(chat);
+    renderChatsList();
+    scheduleServerSync('pinChat');
+};
+
+window.deleteChatFromSidebar = function(id, e) {
+    e.stopPropagation();
+    if (confirm(uiText('deleteChatConfirm', { fallback: 'Are you sure you want to delete this chat?' }))) {
+        chats = chats.filter(c => c.id !== id);
+        saveChatToStorage();
+        
+        // НОВОЕ: Отправляем запрос на удаление из БД
+        if (currentUser) {
+            apiFetch(`${WORKER_URL}/delete-chat`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id: id, user_id: currentUser.id })
+            }).catch(err => console.error('Failed to delete chat:', err));
+        }
+
+        if(currentChatId === id) startNewChat();
+        else renderChatsList();
+    }
+};
+
+window.toggleChatGroup = function(event) {
+    if (event) event.stopPropagation(); // Остановка всплытия события, чтобы не закрывался сайдбар
+    const isOpening = localStorage.getItem('solfai_group_open') !== 'true';
+    localStorage.setItem('solfai_group_open', isOpening);
+    renderChatsList();
+};
+
+function renderChatsList() {
+    if (!chatsList) return;
+    sortChatsCanonical(chats);
+
+    const shouldGroup = chats.length > TOP_VISIBLE_CHATS;
+    const groupOpen = localStorage.getItem('solfai_group_open') === 'true';
+    let html = '';
+    
+    if (!shouldGroup) {
+        html = chats.slice(0, MAX_SAVED_CHATS).map(chat => renderChatItemHTML(chat)).join('');
+    } else {
+        const recentChats = chats.slice(0, TOP_VISIBLE_CHATS);
+        const olderChats = chats.slice(TOP_VISIBLE_CHATS, TOP_VISIBLE_CHATS + OLDER_VISIBLE_CHATS);
+        html += recentChats.map(chat => renderChatItemHTML(chat)).join('');
+        
+        const olderLabel = (typeof solfaiGetText === 'function' ? solfaiGetText('olderChatsGroup') : '').replace(/\{n\}/g, String(olderChats.length)) || `Older chats (${olderChats.length})`;
+        html += `
+        <div class="chats-group-header ${groupOpen ? 'open' : ''}" onclick="toggleChatGroup(event)">
+            <span class="chats-group-header-label">
+                <svg class="svg-icon chats-group-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path></svg>
+                <span>${olderLabel}</span>
+            </span>
+            <svg class="svg-icon group-arrow" viewBox="0 0 24 24" aria-hidden="true"><polyline points="6 9 12 15 18 9"></polyline></svg>
+        </div>`;
+        
+        const limitNotice = (typeof solfaiGetText === 'function' ? solfaiGetText('chatLimitNotice') : '') || `Only the last ${MAX_SAVED_CHATS} chats are saved.`;
+        html += `
+        <div class="chats-group-list" style="display: grid; grid-template-rows: ${groupOpen ? '1fr' : '0fr'}; transition: grid-template-rows 0.3s;">
+            <div style="overflow: hidden;">
+                ${olderChats.map(chat => renderChatItemHTML(chat)).join('')}
+                <div class="chat-limit-notice">${limitNotice}</div>
+            </div>
+        </div>`;
+    }
+
+    chatsList.innerHTML = html;
+    chatsList.querySelectorAll('.chat-item').forEach(item => {
+        item.addEventListener('click', (e) => {
+            e.stopPropagation();
+            loadChat(item.dataset.id);
+            closeAllOverlays();
+        });
+    });
+}
+
+// ===== ТЕМА =====
+function toggleTheme() { setTheme(currentTheme === 'default' ? 'light' : 'default'); }
+
+function refreshVisibleNotations(root) {
+    const scope = root || document.getElementById('chatMessages') || document;
+    scope.querySelectorAll('.solf-notation[data-rendered]').forEach(el => {
+        el.removeAttribute('data-rendered');
+        el.innerHTML = '<div class="notation-loading">♪</div>';
+    });
+    renderAllNotations(scope);
+}
+
+function setTheme(theme) {
+    currentTheme = theme;
+    localStorage.setItem('solfai_theme', theme);
+    document.documentElement.setAttribute('data-theme', theme === 'default' ? '' : theme);
+    
+    const sunIcon = '<circle cx="12" cy="12" r="5"></circle><line x1="12" y1="1" x2="12" y2="3"></line><line x1="12" y1="21" x2="12" y2="23"></line><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line><line x1="1" y1="12" x2="3" y2="12"></line><line x1="21" y1="12" x2="23" y2="12"></line><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>';
+    const moonIcon = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>';
+   
+    document.querySelectorAll('#themeIconSvg, #headerThemeIconSvg, #mobileThemeIconSvg').forEach(el => {
+    if (el) el.innerHTML = theme === 'light' ? sunIcon : moonIcon;
+});
+    document.querySelectorAll('#themeIconSvg, #headerThemeIconSvg').forEach(el => {
+        if (el) el.innerHTML = theme === 'light' ? sunIcon : moonIcon;
+    });
+    refreshVisibleNotations();
+}
+function initTheme() {
+    setTheme(currentTheme);
+    window.addEventListener('storage', (e) => {
+        if (e.key === 'solfai_theme' && e.newValue) {
+            currentTheme = e.newValue;
+            document.documentElement.setAttribute('data-theme', e.newValue === 'default' ? '' : e.newValue);
+            refreshVisibleNotations();
+        }
+        if (e.key === 'solfai_color' && e.newValue) {
+            currentColor = e.newValue;
+            if (e.newValue === 'default') document.documentElement.removeAttribute('data-color');
+            else document.documentElement.setAttribute('data-color', e.newValue);
+            refreshVisibleNotations();
+        }
+    });
+}
+
+function setColor(color) {
+    currentColor = color;
+    localStorage.setItem('solfai_color', color);
+
+    if (color === 'default') {
+        document.documentElement.removeAttribute('data-color');
+    } else {
+        document.documentElement.setAttribute('data-color', color);
+    }
+
+    document.querySelectorAll('.color-btn').forEach(btn => {
+        btn.classList.toggle('active', btn.dataset.color === color);
+    });
+    refreshVisibleNotations();
+}
+
+function initColor() {
+    setColor(currentColor);
+}
+
+function setFontSize(size) {
+    currentFontSize = size || 'md';
+    localStorage.setItem('solfai_font_size', currentFontSize);
+    document.documentElement.setAttribute('data-font-size', currentFontSize);
+}
+
+function initFontSize() {
+    setFontSize(currentFontSize);
+}
+
+// ===== ТАРИФЫ И КНОПКА UPGRADE =====
+function getPlanStorageKey() { return `solfai_plan_${currentUser ? currentUser.id : 'guest'}`; }
+function getStoredPlan() { return JSON.parse(localStorage.getItem(getPlanStorageKey())) || { type: "free", emoji: PLAN_ICONS.free, name: "Free" }; }
+
+function updatePlanDisplay() {
+    if (isUserLoggedIn() && currentUser?.plan_type && PLAN_LIMITS[currentUser.plan_type]) {
+        const planType = currentUser.plan_type;
+        currentPlan = {
+            type: planType,
+            emoji: PLAN_ICONS[planType] || PLAN_ICONS.free,
+            name: planType.charAt(0).toUpperCase() + planType.slice(1),
+        };
+    } else {
+        currentPlan = getStoredPlan();
+    }
+    document.documentElement.classList.toggle('show-upgrade',
+        !!currentUser && currentPlan.type !== 'pro' && currentPlan.type !== 'unlimited');
+    document.documentElement.setAttribute('data-plan', currentPlan.type || 'free');
+    const sidebarPlanIcon = document.getElementById('sidebarPlanIcon');
+    if (sidebarPlanIcon) { sidebarPlanIcon.innerHTML = currentPlan.emoji || PLAN_ICONS.free; }
+    updateRequestsCounter();
+    refreshImageAttachVisibility();
+}
+
+function refreshImageAttachVisibility() {
+    document.documentElement.classList.toggle('has-image-quota', getRemainingImages() > 0);
+    // Картинки тоже отражаются на бейдже "X/Y" в шапке сайдбара — синхронизируем.
+    if (typeof updateSidebarQuotaBadge === 'function') updateSidebarQuotaBadge();
+}
+
+// === Лимиты запросов: источники истины ===
+//
+// ЗАЛОГИНЕННЫЙ ЮЗЕР (есть currentUser.id):
+//   Источник истины — БД (Cloudflare Workers).
+//   - При логине  : `/get-user` через syncAppData() → currentUser.requests_count
+//   - При запросе : `/increment-usage` (атомарно) → applyUsageFromServer → затем ответ
+//   localStorage для них НЕ используется как источник истины: даже если юзер очистит кеш,
+//   лимит из БД остаётся. Два устройства не могут «перезаписать» счётчик друг друга.
+//
+// ГОСТЬ (не залогинен):
+//   Источник истины — localStorage `solfai_usage_guest`.
+//   У гостей нет аккаунта, БД не знает кто это, так что хранить негде.
+//   Юзер может сбросить кеш и получить ещё 3 запроса — это by design для незалогиненных.
+function isUserLoggedIn() { return Boolean(currentUser?.id); }
+
+function getUsageKey() { return `solfai_usage_${currentUser?.id || 'guest'}`; }
+function getUsageData() {
+    const data = JSON.parse(localStorage.getItem(getUsageKey()) || '{}');
+    if (!data.timestamp || (Date.now() - data.timestamp) > USAGE_WINDOWS.request) return { timestamp: Date.now(), count: 0 };
+    return data;
+}
+function saveUsageData(data) { localStorage.setItem(getUsageKey(), JSON.stringify(data)); }
+
+function getRemainingRequests() { 
+    const limit = PLAN_LIMITS[currentPlan?.type || 'free'].requests;
+    if (limit === Infinity) return 9999;
+
+    if (isUserLoggedIn()) {
+        // Только БД / currentUser. Если sync ещё не подтянул requests_count —
+        // НЕ считаем usage=0 (иначе мигает полный лимит 50/50 и путает с реальным сбросом).
+        const dbUsage = Number(currentUser?.requests_count);
+        if (!Number.isFinite(dbUsage)) {
+            const cached = Number(JSON.parse(localStorage.getItem('solfai_user') || '{}')?.requests_count);
+            if (Number.isFinite(cached)) return Math.max(0, limit - cached);
+            return limit; // неизвестно — показываем лимит, бэк всё равно проверит
+        }
+        return Math.max(0, limit - dbUsage);
+    }
+
+    return Math.max(0, limit - getUsageData().count);
+}
+function useRequest() {
+    const limit = PLAN_LIMITS[currentPlan?.type || 'free'].requests;
+    if (limit === Infinity) return true;
+
+    if (isUserLoggedIn()) {
+        // Оптимистичный инкремент в memory: UI сразу показывает "запросов на 1 меньше",
+        // не дожидаясь ответа /increment-usage. БД — источник истины:
+        //  - если /increment-usage придёт OK, currentUser.requests_count перезапишется им
+        //    (см. блок около ~1803);
+        //  - если упадёт сеть, останется наш +1 — пользователь не сможет сделать сверх лимита,
+        //    а при следующем syncAppData значение поправится из БД.
+        const cur = Number(currentUser.requests_count) || 0;
+        if (cur >= limit) return false;
+        currentUser.requests_count = cur + 1;
+        updateRequestsCounter();
+        return true;
+    }
+
+    const usage = getUsageData();
+    if (usage.count < limit) { usage.count++; if(!usage.timestamp) usage.timestamp=Date.now(); saveUsageData(usage); updateRequestsCounter(); return true; }
+    return false;
+}
+function updateRequestsCounter() {
+    const remaining = getRemainingRequests();
+    const limit = PLAN_LIMITS[currentPlan?.type || 'free'].requests;
+    // Компактный бейдж в шапке сайдбара: "молния X/Y" (запросы / картинки).
+    // Логика: ∞-тариф — показываем ∞; тариф без картинок — только число запросов;
+    // иначе — "X/Y". Окрашиваем в warning/exhausted по тем же правилам, что и старый счётчик.
+    updateSidebarQuotaBadge();
+    refreshSendButtonState();
+}
+
+function updateSidebarQuotaBadge() {
+    const badge = document.getElementById('sidebarQuotaBadge');
+    const textEl = document.getElementById('sidebarQuotaText');
+    if (!badge || !textEl) return;
+
+    // Защита от клика ДО первичной инициализации (в HTML href зашит статически): если гость
+    // успеет нажать молнию раньше, чем отработает логика ниже — блокируем переход на pricing.
+    if (!badge.dataset.guardBound) {
+        badge.dataset.guardBound = '1';
+        badge.addEventListener('click', e => {
+            if (!isUserLoggedIn()) {
+                e.preventDefault();
+                // Вместо перехода на pricing предлагаем сначала войти.
+                try { navigateToLogin?.(); } catch (_) {}
+            }
+        });
+    }
+    const planType = currentPlan?.type || 'free';
+    const reqLimit = PLAN_LIMITS[planType].requests;
+    const imgLimit = PLAN_LIMITS[planType].images;
+    const reqRemain = getRemainingRequests();
+    const imgRemain = (typeof getRemainingImages === 'function') ? getRemainingImages() : 0;
+    let label;
+    if (reqLimit === Infinity && imgLimit === Infinity) {
+        label = '∞';
+    } else if (imgLimit === 0 || imgLimit == null) {
+        // Тариф без картинок — показываем только число запросов, без "/0", чтобы не путать.
+        label = (reqLimit === Infinity) ? '∞' : String(reqRemain);
+    } else {
+        const reqStr = (reqLimit === Infinity) ? '∞' : String(reqRemain);
+        const imgStr = (imgLimit === Infinity) ? '∞' : String(imgRemain);
+        label = `${reqStr}/${imgStr}`;
+    }
+    textEl.textContent = label;
+    badge.classList.remove('warning', 'exhausted');
+    if (reqLimit !== Infinity) {
+        if (reqRemain === 0) badge.classList.add('exhausted');
+        else if (reqRemain === 1) badge.classList.add('warning');
+    }
+
+    // Гость не может менять тариф: бейдж-молния показывает счётчик, но НЕ ведёт на pricing,
+    // пока пользователь не войдёт в аккаунт. Снимаем href (ссылка перестаёт быть кликабельной),
+    // помечаем .disabled + aria-disabled и подменяем title-подсказку.
+    const loggedIn = isUserLoggedIn();
+    badge.classList.toggle('disabled', !loggedIn);
+    badge.setAttribute('aria-disabled', String(!loggedIn));
+    if (loggedIn) {
+        badge.setAttribute('href', 'pricing.html');
+        badge.removeAttribute('tabindex');
+        // Подробный title — на десктопе появится при ховере: "Запросов: 49 · Картинок: 5".
+        const titleParts = [];
+        titleParts.push(`${uiText('quotaRequests', { fallback: 'Requests' })}: ${(reqLimit === Infinity) ? '∞' : `${reqRemain}/${reqLimit}`}`);
+        if (imgLimit > 0) titleParts.push(`${uiText('quotaImages', { fallback: 'Images' })}: ${(imgLimit === Infinity) ? '∞' : `${imgRemain}/${imgLimit}`}`);
+        badge.title = titleParts.join(' · ');
+    } else {
+        badge.removeAttribute('href');
+        badge.setAttribute('tabindex', '-1');
+        badge.title = uiText('signInToChangePlan', { fallback: 'Sign in to change your plan' });
+    }
+}
+
+function getImageUsageKey() { return `solfai_img_${currentUser?.id || 'guest'}`; }
+function getImageUsageData() {
+    const data = JSON.parse(localStorage.getItem(getImageUsageKey()) || '{}');
+    if (!data.timestamp || (Date.now() - data.timestamp) > USAGE_WINDOWS.image) return { timestamp: Date.now(), count: 0 };
+    return data;
+}
+function getRemainingImages() {
+    const limit = PLAN_LIMITS[currentPlan?.type || 'free'].images;
+    if (limit === Infinity) return 9999;
+    if (limit === 0) return 0;
+
+    if (isUserLoggedIn()) {
+        // Та же логика, что и для requests: БД — единственный источник истины.
+        const dbUsage = Number(currentUser?.images_count);
+        return Math.max(0, limit - (Number.isFinite(dbUsage) ? dbUsage : 0));
+    }
+    return Math.max(0, limit - getImageUsageData().count);
+}
+function useImage() {
+    const limit = PLAN_LIMITS[currentPlan?.type || 'free'].images;
+    if (limit === Infinity) return true;
+    if (limit === 0) return false;
+
+    if (isUserLoggedIn()) {
+        const cur = Number(currentUser.images_count) || 0;
+        if (cur >= limit) return false;
+        currentUser.images_count = cur + 1;
+        refreshImageAttachVisibility();
+        return true;
+    }
+
+    const usage = getImageUsageData();
+    if (usage.count < limit) { 
+        usage.count++; 
+        if(!usage.timestamp) usage.timestamp=Date.now(); 
+        localStorage.setItem(getImageUsageKey(), JSON.stringify(usage)); 
+        refreshImageAttachVisibility();
+        return true; 
+    }
+    return false;
+}
+
+function showLimitModal() { limitModal?.classList.add('active'); updateLimitTimer(); }
+function showImageLimitModal() { 
+    closeAllOverlays(); 
+    document.getElementById('imageLimitModal')?.classList.add('active'); 
+    updateImageLimitTimer(); 
+    refreshImageAttachVisibility();
+}
+
+function rollbackRequestUsage() {
+    if (isUserLoggedIn()) {
+        currentUser.requests_count = Math.max(0, (Number(currentUser.requests_count) || 0) - 1);
+    } else {
+        const usage = getUsageData();
+        usage.count = Math.max(0, (usage.count || 0) - 1);
+        saveUsageData(usage);
+    }
+    updateRequestsCounter();
+}
+
+function rollbackImageUsage() {
+    if (isUserLoggedIn()) {
+        currentUser.images_count = Math.max(0, (Number(currentUser.images_count) || 0) - 1);
+    } else {
+        const usage = getImageUsageData();
+        usage.count = Math.max(0, (usage.count || 0) - 1);
+        localStorage.setItem(getImageUsageKey(), JSON.stringify(usage));
+    }
+    refreshImageAttachVisibility();
+}
+
+function applyUsageFromServer(usage) {
+    if (!usage || !currentUser?.id) return;
+    if (Number.isFinite(Number(usage.requests_count))) currentUser.requests_count = Number(usage.requests_count);
+    if (Number.isFinite(Number(usage.images_count))) currentUser.images_count = Number(usage.images_count);
+    if (Number.isFinite(Number(usage.quiz_count))) currentUser.quiz_count = Number(usage.quiz_count);
+    if (Number.isFinite(Number(usage.requests_window_start))) currentUser.requests_window_start = Number(usage.requests_window_start);
+    if (Number.isFinite(Number(usage.images_window_start))) currentUser.images_window_start = Number(usage.images_window_start);
+    if (Number.isFinite(Number(usage.quiz_window_start))) currentUser.quiz_window_start = Number(usage.quiz_window_start);
+    localStorage.setItem('solfai_user', JSON.stringify(currentUser));
+    updateRequestsCounter();
+    refreshImageAttachVisibility();
+    if (typeof updateQuizCounter === 'function') updateQuizCounter();
+}
+
+/**
+ * Перед ответом: атомарно списываем квоту в БД и обновляем UI актуальными счётчиками.
+ * Так два устройства не могут «съесть» один и тот же остаток из устаревшего кэша.
+ *
+ * Возвращает user-snapshot при успехе.
+ * Кидает ошибку только при реальном лимите (429/403 LIMIT_*).
+ * Сетевые/500 ошибки — return null: тогда /generate сам спишет квоту.
+ */
+async function consumeUsageOnServer(type = 'request') {
+    if (!isUserLoggedIn()) return null;
+    let res;
+    try {
+        res = await apiFetch(`${WORKER_URL}/increment-usage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: currentUser.id, type }),
+        }, 12000);
+    } catch (netErr) {
+        console.warn('[Solf.ai] consumeUsageOnServer network error, defer to /generate:', netErr);
+        return null;
+    }
+    const data = await res.json().catch(() => ({}));
+    // Даже на 429 сервер отдаёт актуальные counts — синхронизируем бейдж
+    if (Number.isFinite(Number(data.requests_count)) || data.usage) {
+        applyUsageFromServer(data.usage || data);
+    }
+    if (res.ok) {
+        applyUsageFromServer(data);
+        return data;
+    }
+    const code = data.code || '';
+    const isLimit = res.status === 429 || res.status === 403 ||
+        code === 'LIMIT_REQUESTS' || code === 'LIMIT_IMAGES' || code === 'LIMIT_QUIZ';
+    if (isLimit) {
+        const err = new Error(data.error || 'Usage limit');
+        err.status = res.status;
+        err.code = code || (type === 'image' ? 'LIMIT_IMAGES' : 'LIMIT_REQUESTS');
+        throw err;
+    }
+    // Worker ещё не задеплоен / SQL глюк — не блокируем чат ложным "0 requests"
+    console.warn('[Solf.ai] consumeUsageOnServer soft-fail', res.status, data);
+    return null;
+}
+
+/** Откат серверного списания, если генерация упала до ответа. */
+async function refundUsageOnServer(type = 'request') {
+    if (!isUserLoggedIn()) return;
+    try {
+        const res = await apiFetch(`${WORKER_URL}/decrement-usage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: currentUser.id, type }),
+        }, 12000);
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) applyUsageFromServer(data);
+    } catch (err) {
+        console.warn('[Solf.ai] usage refund failed:', err);
+    }
+}
+
+function getWindowRemainingMs(startMs, windowMs) {
+    const start = Number(startMs) || 0;
+    if (!start) return windowMs;
+    return Math.max(0, windowMs - (Date.now() - start));
+}
+
+function updateLimitTimer() {
+    const timerEl = document.getElementById('limitTimer');
+    if (!timerEl) return;
+    const windowMs = USAGE_WINDOWS.request;
+    if (isUserLoggedIn()) {
+        const remaining = getWindowRemainingMs(currentUser?.requests_window_start, windowMs);
+        timerEl.textContent = formatResetTimer(uiText('resetIn', { fallback: 'Reset in:' }), Math.floor(remaining / 3600000), Math.floor((remaining % 3600000) / 60000));
+        return;
+    }
+    const data = JSON.parse(localStorage.getItem(getUsageKey()) || '{}');
+    if (data.timestamp) {
+        const remaining = windowMs - (Date.now() - data.timestamp);
+        timerEl.textContent = remaining > 0
+            ? formatResetTimer(uiText('resetIn', { fallback: 'Reset in:' }), Math.floor(remaining / 3600000), Math.floor((remaining % 3600000) / 60000))
+            : formatResetTimer(uiText('resetIn', { fallback: 'Reset in:' }), 0, 0);
+    } else timerEl.textContent = formatResetTimer(uiText('resetIn', { fallback: 'Reset in:' }), 24, 0);
+}
+function updateImageLimitTimer() {
+    const timerEl = document.getElementById('imageLimitTimer');
+    if (!timerEl) return;
+    const windowMs = USAGE_WINDOWS.image;
+    if (isUserLoggedIn()) {
+        const remaining = getWindowRemainingMs(currentUser?.images_window_start, windowMs);
+        timerEl.textContent = formatResetTimer(uiText('resetIn', { fallback: 'Reset in:' }), Math.floor(remaining / 3600000), Math.floor((remaining % 3600000) / 60000));
+        return;
+    }
+    const data = JSON.parse(localStorage.getItem(getImageUsageKey()) || '{}');
+    if (data.timestamp) {
+        const remaining = windowMs - (Date.now() - data.timestamp);
+        timerEl.textContent = remaining > 0
+            ? formatResetTimer(uiText('resetIn', { fallback: 'Reset in:' }), Math.floor(remaining / 3600000), Math.floor((remaining % 3600000) / 60000))
+            : formatResetTimer(uiText('resetIn', { fallback: 'Reset in:' }), 0, 0);
+    } else timerEl.textContent = formatResetTimer(uiText('resetIn', { fallback: 'Reset in:' }), 24, 0);
+}
+
+function showToast(message, type = 'success', options = {}) {
+    const dedupeKey = options.dedupeKey;
+    const dismissOnClick = options.dismissOnClick;
+    let container = document.getElementById('toastContainer');
+    if (!container) { container = document.createElement('div'); container.id = 'toastContainer'; container.className = 'toast-container'; document.body.appendChild(container); }
+    if (dedupeKey) {
+        container.querySelectorAll(`[data-toast-dedupe="${dedupeKey}"]`).forEach(t => t.remove());
+    }
+    const toast = document.createElement('div'); toast.className = `toast ${type}`;
+    if (dedupeKey) toast.dataset.toastDedupe = dedupeKey;
+    toast.innerHTML = `<span class="toast-icon">${type === 'success' ? '✓' : '✕'}</span><span>${message}</span>`;
+    container.appendChild(toast);
+    if (dismissOnClick) {
+        const removeToast = () => {
+            if (!toast.isConnected) return;
+            toast.remove();
+            document.removeEventListener('pointerdown', onPointerDown, true);
+        };
+        const onPointerDown = (e) => {
+            if (!toast.isConnected) return;
+            if (toast.contains(e.target)) return;
+            removeToast();
+        };
+        document.addEventListener('pointerdown', onPointerDown, { capture: true });
+        setTimeout(() => removeToast(), 3000);
+        return toast;
+    }
+    setTimeout(() => toast.remove(), 3000);
+    return toast;
+}
+
+// ===== ДВИЖОК ЧАТА =====
+function saveChatToServer(chat) {
+    if (!currentUser?.id || !chat?.id) return;
+    apiFetch(`${WORKER_URL}/save-chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...chat, user_id: currentUser.id })
+    }).catch(err => console.error('Failed to save chat:', err));
+}
+
+function saveChatToStorage() {
+    enforceChatLimit();
+    const slimChats = chats.slice(0, MAX_SAVED_CHATS).map(c => ({
+        id: c.id, title: c.title, pinned: c.pinned, createdAt: c.createdAt, updatedAt: c.updatedAt,
+        messages: c.messages.slice(-60).map(m => ({ role: m.role, id: m.id, content: m.content.slice(0, 4000), attachments: m.attachments || [] }))
+    }));
+    try { localStorage.setItem(getChatsStorageKey(), JSON.stringify(slimChats)); } 
+    catch (e) { localStorage.setItem(getChatsStorageKey(), JSON.stringify(slimChats.map(c => ({...c, messages: c.messages.map(m => ({...m, attachments: []}))})))); }
+
+    // Отправка текущего чата в базу данных NeonDB
+    if (currentUser && currentChatId) {
+        const currentChatData = chats.find(c => c.id === currentChatId);
+        if (currentChatData) saveChatToServer(currentChatData);
+    }
+}
+
+function createNewChat(firstMessage) {
+    const chat = { id: Date.now().toString(), title: firstMessage.slice(0, 30) + '...', messages: [], createdAt: new Date().toISOString() };
+    chats.unshift(chat); currentChatId = chat.id; saveChatToStorage(); renderChatsList(); return chat;
+}
+
+function loadChat(chatId) {
+    cancelActiveTyping();
+    const chat = chats.find(c => c.id === chatId);
+    if (!chat) return;
+    currentChatId = chatId; chatTitle.textContent = chat.title; chatMessages.innerHTML = '';
+    window.__solfaiResponseLang = detectResponseLanguage('', chat.messages);
+    if (window.SolfTheory && typeof window.SolfTheory.setLabelLocale === 'function') {
+        window.SolfTheory.setLabelLocale(window.__solfaiResponseLang);
+    }
+    chat.messages.forEach((msg, i) => {
+        let content = msg.content;
+        if (msg.role === 'ai' && i > 0) {
+            const prev = chat.messages[i - 1];
+            if (prev && prev.role === 'user' && countRequestedParts(prev.content) < 2 && !isMultiTopicQuery(prev.content)) {
+                content = patchAiWithTheory(prev.content, content);
+            }
+        }
+        addMessageToUI(msg.role, content, msg.attachments, false, msg.id);
+    });
+    renderChatsList();
+    syncGenerationUiForChat(chatId);
+    requestAnimationFrame(() => syncGenerationUiForChat(chatId));
+}
+
+function cancelActiveTyping() {
+    if (activeTypingCancel) {
+        activeTypingCancel.cancelled = true;
+        activeTypingCancel = null;
+    }
+}
+
+function scrollToBottom(force = false) {
+    if (!chatMessages) return;
+    if (!force && !shouldAutoScroll) return;
+    requestAnimationFrame(() => {
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    });
+}
+
+async function addMessageToUI(role, content, attachments = [], withTyping = false, messageId = null) {
+    if (messageId && chatMessages?.querySelector(`[data-message-id="${messageId}"]`)) return;
+    const div = document.createElement('div');
+    div.className = `message message-${role}`;
+    if (messageId) div.dataset.messageId = messageId;
+    
+    let attHTML = attachments.filter(a => a.type.startsWith('image/')).map(a => `<div class="message-attachment"><img src="${a.data}" alt=""></div>`).join('');
+    const avatarSVG = role === 'user' ? '<svg class="svg-icon" viewBox="0 0 24 24"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>' : '<svg class="svg-icon" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg>';
+    
+    const aiCopyBtnHtml = `<button class="message-copy-btn" type="button" onclick="copyAiMessage(this)" aria-label="Copy message">
+            <svg class="copy-icon icon-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"></rect><rect x="4" y="4" width="11" height="11" rx="2"></rect></svg>
+            <svg class="copy-icon icon-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"></polyline></svg>
+        </button>`;
+    const includeCopyBtn = role === 'ai' && !withTyping;
+    const aiCopyBtn = includeCopyBtn ? aiCopyBtnHtml : '';
+    div.innerHTML = `<div class="message-avatar">${avatarSVG}</div><div class="message-body"><div class="message-content ${withTyping ? 'typing' : ''}">${withTyping ? '' : formatMessage(content)}${attHTML}</div>${aiCopyBtn}</div>`;
+    chatMessages.appendChild(div); 
+
+    if (!withTyping) {
+        renderAllNotations(div);
+    }
+    
+    // Прокручиваем, если включен автоскролл или это новое сообщение от пользователя
+    if (shouldAutoScroll || role === 'user') {
+        scrollToBottom(true);
+    }
+    
+    if (withTyping && role === 'ai') {
+        await typeMessage(div.querySelector('.message-content'), content, attHTML);
+        div.querySelector('.message-body')?.insertAdjacentHTML('beforeend', aiCopyBtnHtml);
+    }
+}
+
+async function typeMessage(contentEl, text, attachmentHTML) {
+    autoScrollPausedByUser = false;
+    shouldAutoScroll = true;
+    const disableAutoScrollOnInteraction = () => {
+        autoScrollPausedByUser = true;
+        shouldAutoScroll = false;
+    };
+    const interactionEvents = ['touchstart', 'pointerdown', 'wheel'];
+    const scrollRoot = chatMessages || contentEl.closest('.chat-messages');
+    const onScrollDuringTyping = () => {
+        if (!scrollRoot) return;
+        const isAtBottom = scrollRoot.scrollHeight - scrollRoot.scrollTop - scrollRoot.clientHeight < 20;
+        if (!isAtBottom) disableAutoScrollOnInteraction();
+    };
+    interactionEvents.forEach(ev => scrollRoot?.addEventListener(ev, disableAutoScrollOnInteraction, { passive: true }));
+    scrollRoot?.addEventListener('scroll', onScrollDuringTyping, { passive: true });
+
+    const typingToken = { cancelled: false };
+    activeTypingCancel = typingToken;
+
+    const formattedText = formatMessage(text);
+    const typingSource = stripNotationBlocks(text);
+    const tempDiv = document.createElement('div'); tempDiv.innerHTML = formatMessage(typingSource);
+    const plainText = tempDiv.textContent;
+    const cursor = document.createElement('span'); cursor.className = 'typing-cursor'; contentEl.appendChild(cursor);
+
+    try {
+        for (let i = 0; i < plainText.length; i++) {
+            if (typingToken.cancelled) break;
+            contentEl.innerHTML = formatPartialText(typingSource, i + 1) + '<span class="typing-cursor"></span>';
+
+            if (shouldAutoScroll) {
+                scrollToBottom();
+            }
+
+            await new Promise(r => setTimeout(r, '.!?'.includes(plainText[i]) ? TYPING_SPEED*4 : TYPING_SPEED));
+        }
+        if (!typingToken.cancelled) {
+            contentEl.classList.remove('typing'); contentEl.innerHTML = formattedText + attachmentHTML;
+            renderAllNotations(contentEl.parentElement || contentEl);
+            if (shouldAutoScroll) {
+                scrollToBottom();
+            }
+        }
+    } finally {
+        if (activeTypingCancel === typingToken) activeTypingCancel = null;
+        interactionEvents.forEach(ev => scrollRoot?.removeEventListener(ev, disableAutoScrollOnInteraction));
+        scrollRoot?.removeEventListener('scroll', onScrollDuringTyping);
+    }
+}
+function formatPartialText(fullText, charCount) {
+    let res = '', pIdx = 0, i = 0, inBold = false;
+    while (i < fullText.length && pIdx < charCount) {
+        if (fullText.slice(i, i+2) === '**') { res += inBold ? '</strong>' : '<strong>'; inBold = !inBold; i+=2; } 
+        else if (fullText[i] === '\n') { res += '<br>'; pIdx++; i++; } 
+        else { res += fullText[i]; pIdx++; i++; }
+    }
+    if (inBold) res += '</strong>'; return res;
+}
+
+// ===== НОТНАЯ ЗАПИСЬ: парсинг + рендер VexFlow =====
+const NOTATION_BLOCK_RE = /\[\[NOTATION:\s*(\{[\s\S]*?\})\s*\]\]/g;
+
+function stripNotationBlocks(text) {
+    if (typeof text !== 'string') return '';
+    return text
+        .replace(NOTATION_BLOCK_RE, '')
+        // Незавершённый (обрезанный ответом модели) хвост "[[NOTATION:..." без закрывающих "]]"
+        // — тоже вырезаем, чтобы он не печатался по буквам как сырой JSON.
+        .replace(/\[\[NOTATION:[\s\S]*$/, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
+
+// Попытка восстановить ОБРЕЗАННЫЙ нотный блок (ответ модели оборвался на середине JSON,
+// например из-за лимита токенов / "high demand"). Берём пришедший фрагмент, обрезаем его до
+// последней ПОЛНОСТЬЮ закрытой ноты внутри "notes":[...] и достраиваем закрывающие "]}".
+// Возвращает распарсенный объект нотации или null, если чинить нечего.
+function repairTruncatedNotation(fragment) {
+    if (typeof fragment !== 'string') return null;
+    const start = fragment.indexOf('{');
+    if (start === -1) return null;
+    let inStr = false, esc = false;
+    const stack = [];
+    let lastSafe = -1;
+    for (let i = start; i < fragment.length; i++) {
+        const ch = fragment[i];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (ch === '\\') esc = true;
+            else if (ch === '"') inStr = false;
+            continue;
+        }
+        if (ch === '"') { inStr = true; continue; }
+        if (ch === '{' || ch === '[') { stack.push(ch); continue; }
+        if (ch === '}' || ch === ']') {
+            stack.pop();
+            // Закрыли объект-ноту, находясь прямо внутри массива notes корневого объекта
+            // (stack == ['{','[']). Здесь можно безопасно «обрезать» и достроить JSON.
+            if (ch === '}' && stack.length === 2 && stack[0] === '{' && stack[1] === '[') {
+                lastSafe = i + 1;
+            }
+        }
+    }
+    if (lastSafe === -1) return null;
+    try {
+        const obj = JSON.parse(fragment.slice(start, lastSafe) + ']}');
+        return (obj && Array.isArray(obj.notes) && obj.notes.length) ? obj : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function escapeNotationAttr(json) {
+    return String(json)
+        .replace(/&/g, '&amp;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+}
+
+function formatMessage(text) {
+    if (typeof text !== 'string') return '';
+    // 1) Извлекаем нотные блоки и заменяем их на placeholder-ы (один токен на блок)
+    const placeholders = [];
+    let working = text.replace(NOTATION_BLOCK_RE, (match, json) => {
+        try {
+            const data = normalizeNotationLayout(JSON.parse(json));
+            const idx = placeholders.length;
+            placeholders.push(data);
+            return `\u0001SOLF_NOT_${idx}\u0001`;
+        } catch (e) {
+            console.warn('[Solf.ai] Notation JSON parse failed:', e, json);
+            return '';
+        }
+    });
+
+    // 1b) Обрезанный (незакрытый) блок "[[NOTATION:..." — ответ модели оборвался на середине
+    //     JSON. Не показываем сырой JSON: пробуем восстановить уже пришедшие ноты, иначе ставим
+    //     спец-токен, который ниже заменим на аккуратное уведомление.
+    let truncatedNotice = false;
+    const truncIdx = working.indexOf('[[NOTATION:');
+    if (truncIdx !== -1) {
+        const before = working.slice(0, truncIdx);
+        const repaired = repairTruncatedNotation(working.slice(truncIdx));
+        if (repaired) {
+            const idx = placeholders.length;
+            placeholders.push(repaired);
+            working = before + `\u0001SOLF_NOT_${idx}\u0001`;
+        } else {
+            truncatedNotice = true;
+            working = before + '\u0001SOLF_NOT_TRUNC\u0001';
+        }
+    }
+
+    // 2) Базовое форматирование текста (без нотации)
+    let html = working
+        .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+        .replace(/\n/g, '<br>');
+
+    // 3) Заменяем placeholder-ы на контейнеры для VexFlow.
+    //    Глотаем соседние <br>, чтобы не было пустых строк сверху/снизу карточки.
+    html = html.replace(/(?:<br>\s*)*\u0001SOLF_NOT_(\d+)\u0001(?:\s*<br>)*/g, (m, idx) => {
+        const data = placeholders[Number(idx)];
+        if (!data) return '';
+        const json = escapeNotationAttr(JSON.stringify(data));
+        return `<div class="solf-notation" data-notation="${json}" role="img" aria-label="Music notation"><div class="notation-loading">♪</div></div>`;
+    });
+
+    // Уведомление вместо обрезанного нотного блока, который не удалось восстановить.
+    if (truncatedNotice) {
+        const msg = uiText('notationTruncated', {
+            chat: true,
+            fallback: 'The notation example did not finish loading (response was cut off). Try asking again.'
+        });
+        html = html.replace(/(?:<br>\s*)*\u0001SOLF_NOT_TRUNC\u0001(?:\s*<br>)*/g,
+            `<div class="notation-error">⚠️ ${msg}</div>`);
+    }
+
+    return html;
+}
+
+/** Render every `.solf-notation[data-notation]` inside `root` using VexFlow. */
+function renderAllNotations(root) {
+    if (!root || !root.querySelectorAll) return;
+    const containers = root.querySelectorAll('.solf-notation[data-notation]:not([data-rendered])');
+    if (!containers.length) return;
+
+    // Если VexFlow ещё не догрузился — пробуем чуть позже (CDN, deferred script)
+    if (!getVexFlowNamespace()) {
+        if (renderAllNotations._retries == null) renderAllNotations._retries = 0;
+        if (renderAllNotations._retries < 25) {
+            renderAllNotations._retries++;
+            setTimeout(() => renderAllNotations(root), 150);
+        } else {
+            containers.forEach(c => {
+                c.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationEngineFailed', { chat: true, fallback: 'Music engine failed to load' })}</div>`;
+                c.setAttribute('data-rendered', '1');
+            });
+        }
+        return;
+    }
+
+    containers.forEach(container => {
+        let data;
+        try {
+            data = JSON.parse(container.getAttribute('data-notation'));
+        } catch (e) {
+            container.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationInvalidData', { chat: true, fallback: 'Invalid notation data' })}</div>`;
+            container.setAttribute('data-rendered', '1');
+            return;
+        }
+        renderNotationCard(container, data);
+        container.setAttribute('data-rendered', '1');
+    });
+}
+
+function getVexFlowNamespace() {
+    const ns = (window.Vex && window.Vex.Flow) || window.VexFlow || null;
+    if (!ns) return null;
+    if (ns.Renderer && ns.Stave && ns.StaveNote) return ns;
+    if (ns.Flow && ns.Flow.Renderer) return ns.Flow;
+    return null;
+}
+
+const NOTATION_DURATION_FRACTION = { w: 1, h: 0.5, q: 0.25, '8': 0.125, '16': 0.0625, '32': 0.03125 };
+
+const KEY_FLAT_COUNT = {
+    C: 0, G: 0, D: 0, A: 0, E: 0, B: 0, 'F#': 0, 'C#': 0,
+    F: 1, Bb: 2, Eb: 3, Ab: 4, Db: 5, Gb: 6, Cb: 7
+};
+const KEY_SHARP_COUNT = {
+    C: 0, F: 0, Bb: 0, Eb: 0, Ab: 0, Db: 0, Gb: 0, Cb: 0,
+    G: 1, D: 2, A: 3, E: 4, B: 5, 'F#': 6, 'C#': 7,
+    'G#': 8, 'D#': 9, 'A#': 10
+};
+const FLAT_ORDER = ['b', 'e', 'a', 'd', 'g', 'c', 'f'];
+const SHARP_ORDER = ['f', 'c', 'g', 'd', 'a', 'e', 'b'];
+
+/** AI/legacy: Cm, Gm… → Eb, Bb… (relative major). */
+function normalizeKeySignature(keySig) {
+    const k = String(keySig || 'C').trim();
+    const MAP = {
+        Am: 'C', Em: 'G', Bm: 'D', 'F#m': 'A', 'C#m': 'E', 'G#m': 'B', 'D#m': 'F#', 'A#m': 'C#',
+        Dm: 'F', Gm: 'Bb', Cm: 'Eb', Fm: 'Ab', Bbm: 'Db', Ebm: 'Gb', Abm: 'Cb'
+    };
+    return MAP[k] || k;
+}
+
+function getKeyFlats(keySig) {
+    const n = KEY_FLAT_COUNT[keySig] ?? 0;
+    return FLAT_ORDER.slice(0, n);
+}
+
+function getDefaultAccForLetter(letter, keySig) {
+    const sc = KEY_SHARP_COUNT[keySig] ?? 0;
+    if (sc > 0) {
+        return SHARP_ORDER.slice(0, sc).includes(letter) ? 1 : 0;
+    }
+    return getKeyFlats(keySig).includes(letter) ? -1 : 0;
+}
+
+function parseVfKey(k) {
+    const m = String(k).trim().match(/^([a-g])(bb|b|##|#)?\/(-?\d+)$/i);
+    if (!m) return null;
+    let acc = 0;
+    if (m[2] === '#') acc = 1;
+    else if (m[2] === '##') acc = 2;
+    else if (m[2] === 'b') acc = -1;
+    else if (m[2] === 'bb') acc = -2;
+    return { letter: m[1].toLowerCase(), acc, octave: parseInt(m[3], 10) };
+}
+
+function accToVfSuffix(acc) {
+    if (acc === 0) return '';
+    if (acc > 0) return '#'.repeat(acc);
+    return 'b'.repeat(-acc);
+}
+
+const NOTATION_OCTAVE_LIMITS = {
+    treble: { top: 65, bottom: 48 },
+    bass: { top: 55, bottom: 36 }
+};
+
+function noteAbsFromVfKey(k) {
+    const p = parseVfKey(k);
+    if (!p) return null;
+    const LS = { c: 0, d: 2, e: 4, f: 5, g: 7, a: 9, b: 11 };
+    return p.octave * 12 + LS[p.letter] + p.acc;
+}
+
+function shiftVfKeyOctaveLocal(k, delta) {
+    const m = String(k).trim().match(/^([a-g](?:bb|b|##|#)?)\/(-?\d+)$/i);
+    if (!m) return k;
+    const oct = Math.max(1, Math.min(8, parseInt(m[2], 10) + delta));
+    return `${m[1].toLowerCase()}/${oct}`;
+}
+
+/** Опускает всё упражнение, если ноты выше F5 (скрипичный ключ). */
+function normalizeNotationOctavesLocal(notes, clef) {
+    if (!Array.isArray(notes) || !notes.length) return notes;
+    const lim = NOTATION_OCTAVE_LIMITS[clef === 'bass' ? 'bass' : 'treble'];
+    let maxA = -Infinity;
+    let minA = Infinity;
+    notes.forEach(n => {
+        (n.keys || []).forEach(k => {
+            const a = noteAbsFromVfKey(k);
+            if (a == null) return;
+            maxA = Math.max(maxA, a);
+            minA = Math.min(minA, a);
+        });
+    });
+    if (!Number.isFinite(maxA)) return notes;
+    let shift = 0;
+    if (maxA > lim.top) shift = -Math.ceil((maxA - lim.top) / 12);
+    if (shift && minA + shift * 12 < lim.bottom) {
+        while (shift < 0 && minA + shift * 12 < lim.bottom) shift += 1;
+    }
+    if (!shift) return notes;
+    return notes.map(n => ({
+        ...n,
+        keys: (n.keys || []).map(k => shiftVfKeyOctaveLocal(k, shift))
+    }));
+}
+
+/** Нормализует key + modifier под ключ (бекары, ♭/♯ только где нужно). */
+function prepareKeyForKeySig(key, keySig) {
+    const p = parseVfKey(key);
+    if (!p) return { key, modifier: null };
+    const ks = normalizeKeySignature(keySig);
+    const def = getDefaultAccForLetter(p.letter, ks);
+    const base = `${p.letter}/${p.octave}`;
+    if (p.acc === def) return { key: base, modifier: null };
+    // Знак альтерации абсолютный, а не «разница с ключевым»: рисуем тот, который
+    // реально нужен ноте. Перебор частных случаев оставлял без знака дубль-диез
+    // в диезной тональности (до-дубль-диез в си мажоре выглядел как до-диез).
+    const VF_ACCIDENTAL_GLYPH = { '-2': 'bb', '-1': 'b', '0': 'n', '1': '#', '2': '##' };
+    const modifier = VF_ACCIDENTAL_GLYPH[String(p.acc)];
+    if (modifier) return { key: base, modifier };
+    return { key: `${p.letter}${accToVfSuffix(p.acc)}/${p.octave}`, modifier: null };
+}
+
+function applyNoteAccidentals(note, VF) {
+    const list = note._accList;
+    if (!list?.length || !VF.Accidental) return;
+    list.forEach(({ modifier, origIdx }) => {
+        if (!modifier) return;
+        let idx = origIdx;
+        if (note.sortedKeyProps?.length) {
+            const pos = note.sortedKeyProps.findIndex(s => s.index === origIdx);
+            if (pos >= 0) idx = pos;
+        }
+        try { note.addModifier(new VF.Accidental(modifier), idx); } catch (_) {}
+    });
+    delete note._accList;
+}
+
+function noteCenterX(sn) {
+    try {
+        if (sn.preFormatted === false) return null;
+        const x = typeof sn.getAbsoluteX === 'function' ? sn.getAbsoluteX() : null;
+        if (x == null || !Number.isFinite(x)) return null;
+        const w = typeof sn.getWidth === 'function' ? sn.getWidth() : 36;
+        return x + w / 2;
+    } catch (_) {
+        return null;
+    }
+}
+
+const NOTATION_LABEL_FONT = "'Segoe UI', 'Roboto', 'Noto Sans', system-ui, sans-serif";
+
+/** Latin v/y from AI → capital Cyrillic У (не путается с Latin v). */
+function normalizeIntervalLabel(lbl) {
+    if (!lbl) return lbl;
+    let s = String(lbl);
+    s = s.replace(/^[\u0076\u028B\u0079\u2713\u2714](?=[вмВМ\d.])/i, '\u0423');
+    s = s.replace(/^[\u0443](?=[вм])/i, '\u0423');
+    return s;
+}
+
+function drawChordLabelsBelow(svg, stave, staveNotes, notesData, color) {
+    if (!svg || !staveNotes || !notesData) return;
+    const NS = 'http://www.w3.org/2000/svg';
+    let labelY = (stave.y || 0) + 98;
+    try {
+        if (typeof stave.getBottomY === 'function') labelY = stave.getBottomY() + 20;
+    } catch (_) {}
+    const MIN_X_GAP = 36;
+    const ROW_H = 18;
+    const placed = [];
+    staveNotes.forEach((sn, i) => {
+        const lbl = notesData[i]?.label;
+        if (!lbl) return;
+        let x = noteCenterX(sn);
+        if (x == null) return;
+        let y = labelY;
+        for (let guard = 0; guard < 6; guard++) {
+            const hit = placed.some(p => Math.abs(p.x - x) < MIN_X_GAP && Math.abs(p.y - y) < ROW_H - 1);
+            if (!hit) break;
+            y += ROW_H;
+        }
+        placed.push({ x, y });
+        const t = document.createElementNS(NS, 'text');
+        t.setAttribute('x', String(x));
+        t.setAttribute('y', String(y));
+        t.setAttribute('text-anchor', 'middle');
+        t.setAttribute('dominant-baseline', 'hanging');
+        t.setAttribute('font-family', NOTATION_LABEL_FONT);
+        t.setAttribute('font-size', '16');
+        t.setAttribute('font-weight', '600');
+        t.setAttribute('fill', color);
+        t.textContent = normalizeIntervalLabel(lbl);
+        svg.appendChild(t);
+    });
+}
+
+function vfKeyLine(VF, key, clef) {
+    try {
+        const p = VF.keyProperties(key, clef);
+        return p ? p.line : null;
+    } catch (_) {
+        return null;
+    }
+}
+
+function noteHeadSvgEl(head) {
+    if (!head) return null;
+    try {
+        if (typeof head.getSVGElement === 'function') {
+            const el = head.getSVGElement();
+            if (el) return el;
+        }
+    } catch (_) {}
+    return head.attrs?.el || head.el || null;
+}
+
+/** Дорисовывает овалы унисона, если clone SVG-головки недоступен (VexFlow 4). */
+function drawExtraUnisonOval(svg, x, y, color) {
+    if (!svg || !Number.isFinite(x) || !Number.isFinite(y)) return;
+    const NS = 'http://www.w3.org/2000/svg';
+    const g = document.createElementNS(NS, 'g');
+    g.setAttribute('transform', `translate(${x}, ${y}) rotate(-20)`);
+    const oval = document.createElementNS(NS, 'ellipse');
+    oval.setAttribute('cx', '0');
+    oval.setAttribute('cy', '0');
+    oval.setAttribute('rx', '5.2');
+    oval.setAttribute('ry', '3.8');
+    oval.setAttribute('fill', color);
+    g.appendChild(oval);
+    svg.appendChild(g);
+}
+
+/**
+ * VexFlow даёт максимум 2 смещённые головки на линии; 3+ унисона (Т3 = до×3+ми)
+ * нужно дорисовать. notesData.keys — полные удвоения, в StaveNote — unique.
+ *
+ * Важно: между головками на одной линии оставляем небольшой зазор
+ * (раньше SHIFT≈11 ≈ ширине овала → «слипались»).
+ */
+function expandUnisonHeads(staveNotes, notesData, clef, svg, color, stave) {
+    if (!svg || !staveNotes || !notesData) return;
+    const VF = getVexFlowNamespace();
+    if (!VF) return;
+    // Центр-к-центру: овал ~10–11px + маленький просвет ~3–4px.
+    const HEAD_STEP = 15;
+
+    staveNotes.forEach((sn, idx) => {
+        const rawKeys = notesData[idx]?.keys;
+        if (!Array.isArray(rawKeys)) return;
+
+        const lineWant = new Map();
+        rawKeys.forEach(k => {
+            const line = vfKeyLine(VF, k, clef);
+            if (line == null) return;
+            lineWant.set(line, (lineWant.get(line) || 0) + 1);
+        });
+
+        const heads = sn.note_heads || (typeof sn.getNoteHeads === 'function' ? sn.getNoteHeads() : null);
+        if (!heads || !heads.length) return;
+
+        const byLine = new Map();
+        heads.forEach(h => {
+            if (h.line == null) return;
+            if (!byLine.has(h.line)) byLine.set(h.line, []);
+            byLine.get(h.line).push(h);
+        });
+
+        lineWant.forEach((want, line) => {
+            if (want < 2) return;
+            const lineHeads = byLine.get(line) || [];
+            if (!lineHeads.length) return;
+
+            lineHeads.sort((a, b) => (a.getAbsoluteX?.() || 0) - (b.getAbsoluteX?.() || 0));
+            const anchor = lineHeads[lineHeads.length - 1];
+            const anchorX = anchor.getAbsoluteX?.() || 0;
+            let y = null;
+            try {
+                if (stave && typeof stave.getYForLine === 'function') y = stave.getYForLine(line);
+            } catch (_) {}
+            if (y == null) {
+                try { y = anchor.getAbsoluteY?.() ?? anchor.y ?? null; } catch (_) { y = null; }
+            }
+
+            // Целевые X: влево от основной головки, с равным шагом и зазором.
+            const targets = [];
+            for (let i = 0; i < want; i++) {
+                targets.push(anchorX - HEAD_STEP * (want - 1 - i));
+            }
+
+            // Существующие головки VF расставляем по targets (справа → якорь).
+            const usable = lineHeads.slice(0, Math.min(lineHeads.length, want));
+            usable.forEach((h, i) => {
+                const el = noteHeadSvgEl(h);
+                if (!el) return;
+                const curX = h.getAbsoluteX?.() || anchorX;
+                const dx = targets[targets.length - usable.length + i] - curX;
+                if (Math.abs(dx) < 0.5) return;
+                const prev = el.getAttribute('transform') || '';
+                el.setAttribute('transform', `${prev} translate(${dx}, 0)`.trim());
+            });
+
+            const missing = want - usable.length;
+            if (missing <= 0) return;
+
+            const template = noteHeadSvgEl(anchor);
+            for (let m = 0; m < missing; m++) {
+                const tx = targets[m];
+                const dx = tx - anchorX;
+                if (template && template.parentNode) {
+                    const clone = template.cloneNode(true);
+                    clone.setAttribute('transform', `translate(${dx}, 0)`);
+                    template.parentNode.insertBefore(clone, template);
+                    clone.querySelectorAll('path, rect, ellipse, polygon').forEach(el => {
+                        const fill = el.getAttribute('fill');
+                        if (fill && fill !== 'none') el.setAttribute('fill', color);
+                        const stroke = el.getAttribute('stroke');
+                        if (stroke && stroke !== 'none') el.setAttribute('stroke', color);
+                    });
+                } else if (y != null) {
+                    drawExtraUnisonOval(svg, tx, y, color);
+                }
+            }
+        });
+    });
+}
+
+function buildStaveNote(VF, clef, n, keySig) {
+    const duration = String(n.duration || 'q').toLowerCase();
+    const isRest = duration.includes('r');
+    const rawKeys = Array.isArray(n.keys) && n.keys.length ? n.keys : ['c/4'];
+    // VexFlow 4 с 3× одинаковым key часто теряет головки — в движок отдаём unique,
+    // полные удвоения остаются в n.keys для expandUnisonHeads.
+    const keysForVf = [];
+    if (!isRest) {
+        const seen = new Set();
+        for (const k of rawKeys) {
+            if (seen.has(k)) continue;
+            seen.add(k);
+            keysForVf.push(k);
+        }
+    }
+    const ks = normalizeKeySignature(keySig || 'C');
+    const prepared = isRest
+        ? rawKeys.map(k => ({ key: k, modifier: null }))
+        : keysForVf.map(k => prepareKeyForKeySig(k, ks));
+    const keys = prepared.map(p => p.key);
+    const note = new VF.StaveNote({
+        clef,
+        keys: isRest ? [clef === 'bass' ? 'd/3' : 'b/4'] : keys,
+        duration
+    });
+    if (!isRest) {
+        note._accList = prepared.map((p, origIdx) => (p.modifier ? { modifier: p.modifier, origIdx } : null)).filter(Boolean);
+    }
+    return note;
+}
+
+function noteDurationBeats(durationStr, beatValue) {
+    const raw = String(durationStr || 'q').toLowerCase().replace('r', '');
+    const dotted = /[d.]+$/.test(raw);
+    const key = raw.replace(/[d.]+$/, '');
+    const base = NOTATION_DURATION_FRACTION[key] ?? 0.25;
+    const fraction = dotted ? base * 1.5 : base;
+    return fraction * beatValue;
+}
+
+function groupNotesIntoMeasures(rawNotes, numBeats, beatValue) {
+    const measures = [];
+    let cur = [];
+    let acc = 0;
+    rawNotes.forEach(n => {
+        const beats = noteDurationBeats(n.duration, beatValue);
+        // Если новая нота не помещается — закрываем текущий такт.
+        if (cur.length && acc + beats > numBeats + 1e-6) {
+            measures.push(cur);
+            cur = [];
+            acc = 0;
+        }
+        cur.push(n);
+        acc += beats;
+        if (acc + 1e-6 >= numBeats) {
+            measures.push(cur);
+            cur = [];
+            acc = 0;
+        }
+    });
+    if (cur.length) measures.push(cur);
+    if (!measures.length) measures.push([]);
+    return measures;
+}
+
+/**
+ * Группирует ноты в сегменты-«такты» в зависимости от режима тактовых черт.
+ * - "auto"   — по `timeSignature` (как раньше).
+ * - "manual" — границы задаёт сама модель флагом `barAfter:true`/`endBar:true` на ноте.
+ * - "none"   — не делим на такты совсем; для верстки длинных гамм рубим
+ *              на «виртуальные» сегменты по NOTES_PER_LINE, но граничные черты
+ *              у таких сегментов скрываем при отрисовке (см. renderNotationCard).
+ */
+function groupNotesIntoSegments(rawNotes, mode, numBeats, beatValue) {
+    const NOTES_PER_LINE = 8;
+
+    if (mode === 'manual') {
+        const segments = [];
+        let cur = [];
+        rawNotes.forEach(n => {
+            cur.push(n);
+            if (n && (n.barAfter === true || n.endBar === true)) {
+                segments.push(cur);
+                cur = [];
+            }
+        });
+        if (cur.length) segments.push(cur);
+        if (!segments.length) segments.push([]);
+        return segments;
+    }
+
+    if (mode === 'none') {
+        if (!rawNotes.length) return [[]];
+        const segments = [];
+        for (let i = 0; i < rawNotes.length; i += NOTES_PER_LINE) {
+            segments.push(rawNotes.slice(i, i + NOTES_PER_LINE));
+        }
+        return segments;
+    }
+
+    return groupNotesIntoMeasures(rawNotes, numBeats, beatValue);
+}
+
+function getBarlineNoneType(VF) {
+    try {
+        const t = VF.Barline && VF.Barline.type;
+        if (t && typeof t.NONE !== 'undefined') return t.NONE;
+    } catch (_) { }
+    return 0;
+}
+
+function normalizeNotationLayout(data) {
+    if (!data || typeof data !== 'object') return data;
+    // SATB — только явный layout:"satb" (гармонизация). Не превращаем D7/II7/цепочки
+    // в двухстанную систему: у них 4 звука в одном скрипичном ключе.
+    if (data.layout === 'satb' && Array.isArray(data.chords)) return data;
+    return data;
+}
+
+function groupSatbChords(chords, barlinesMode, numBeats, beatValue) {
+    if (!chords.length) return [[]];
+    const markers = chords.map(c => ({
+        duration: c.duration || 'q',
+        barAfter: c.barAfter
+    }));
+    const segments = groupNotesIntoSegments(markers, barlinesMode, numBeats, beatValue);
+    const result = [];
+    let idx = 0;
+    for (const seg of segments) {
+        result.push(chords.slice(idx, idx + seg.length));
+        idx += seg.length;
+    }
+    if (idx < chords.length) result.push(chords.slice(idx));
+    return result.filter(m => m.length);
+}
+
+function satbChordSliceToNotes(chordSlice, clef) {
+    return chordSlice.map(c => ({
+        keys: clef === 'bass'
+            ? [c.tenor, c.bass].filter(Boolean)
+            : [c.soprano, c.alto].filter(Boolean),
+        duration: c.duration || 'q',
+        label: clef === 'treble' ? c.label : undefined,
+        barAfter: c.barAfter
+    }));
+}
+
+function renderSatbNotationCard(container, data) {
+    const VF = getVexFlowNamespace();
+    if (!VF) {
+        container.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationEngineNotLoaded', { chat: true, fallback: 'Music engine not loaded' })}</div>`;
+        return;
+    }
+    container.innerHTML = '';
+    container.classList.add('solf-notation-satb');
+
+    try {
+        const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+        const noteColor = isLight ? '#1a1a2e' : '#e6e6f0';
+        const keySig = normalizeKeySignature(typeof data.keySignature === 'string' ? data.keySignature : 'C');
+        const rawTimeSig = typeof data.timeSignature === 'string' ? data.timeSignature.trim() : '4/4';
+        const barlinesMode = (['none', 'manual', 'auto'].includes(data.barlines)) ? data.barlines : 'auto';
+        const timeSigHidden = !rawTimeSig || rawTimeSig === 'none' || barlinesMode !== 'auto';
+        const timeSig = timeSigHidden ? '4/4' : rawTimeSig;
+        const tsParts = timeSig.split('/');
+        const numBeats = Math.max(parseInt(tsParts[0], 10) || 4, 1);
+        const beatValue = Math.max(parseInt(tsParts[1], 10) || 4, 1);
+        const chords = Array.isArray(data.chords) ? data.chords : [];
+        const measures = groupSatbChords(chords, barlinesMode, numBeats, beatValue);
+        const barlineNone = getBarlineNoneType(VF);
+
+        const containerW = container.clientWidth || container.parentElement?.clientWidth || 600;
+        const maxW = Math.min(Math.max(containerW - 16, 320), 960);
+        const FIRST_OVERHEAD = 100;
+        const NEXT_OVERHEAD = 14;
+        const PER_NOTE = 28;
+        const MIN_MEASURE = 88;
+        const measureBaseW = m => Math.max(MIN_MEASURE, m.length * PER_NOTE + 22);
+
+        let rows = [];
+        let row = [];
+        let rowW = 0;
+        measures.forEach(m => {
+            const isFirstOfRow = row.length === 0;
+            const overhead = isFirstOfRow ? FIRST_OVERHEAD : NEXT_OVERHEAD;
+            const w = measureBaseW(m) + overhead;
+            if (!isFirstOfRow && rowW + w > maxW) {
+                rows.push(row);
+                row = [{ chords: m, width: FIRST_OVERHEAD + measureBaseW(m), isFirstOfRow: true }];
+                rowW = FIRST_OVERHEAD + measureBaseW(m);
+            } else {
+                row.push({ chords: m, width: w, isFirstOfRow });
+                rowW += w;
+            }
+        });
+        if (row.length) rows.push(row);
+
+        rows.forEach(r => {
+            const total = r.reduce((s, mm) => s + mm.width, 0);
+            const slack = Math.max(0, maxW - total);
+            if (slack > 0) {
+                const totalNotes = r.reduce((s, mm) => s + Math.max(mm.chords.length, 1), 0);
+                r.forEach(mm => {
+                    mm.width += Math.round(slack * (Math.max(mm.chords.length, 1) / totalNotes));
+                });
+            }
+        });
+
+        const STAVE_GAP = 78;
+        const ROW_HEIGHT = 188;
+        const TOP_PAD = 12;
+        const totalHeight = rows.length * ROW_HEIGHT + TOP_PAD + 40;
+        const rowPixelW = rows.reduce((mx, r) => Math.max(mx, r.reduce((s, mm) => s + mm.width, 0)), 0);
+        const totalWidth = Math.max(maxW + 16, rowPixelW + 16);
+
+        const renderer = new VF.Renderer(container, VF.Renderer.Backends.SVG);
+        renderer.resize(totalWidth, totalHeight);
+        const ctx = renderer.getContext();
+        if (typeof ctx.setFillStyle === 'function') ctx.setFillStyle(noteColor);
+        if (typeof ctx.setStrokeStyle === 'function') ctx.setStrokeStyle(noteColor);
+
+        const unisonBatch = [];
+
+        rows.forEach((r, rowIdx) => {
+            let x = 8;
+            const yTreble = TOP_PAD + rowIdx * ROW_HEIGHT;
+            const yBass = yTreble + STAVE_GAP;
+            let firstTrebleStave = null;
+            let lastBassStave = null;
+
+            r.forEach((mm, mIdx) => {
+                const trebleStave = new VF.Stave(x, yTreble, mm.width);
+                const bassStave = new VF.Stave(x, yBass, mm.width);
+                if (mm.isFirstOfRow) {
+                    try { trebleStave.addClef('treble'); } catch (_) {}
+                    try { bassStave.addClef('bass'); } catch (_) {}
+                    try { trebleStave.addKeySignature(keySig); } catch (_) {}
+                    try { bassStave.addKeySignature(keySig); } catch (_) {}
+                    if (rowIdx === 0 && mIdx === 0 && !timeSigHidden) {
+                        try { trebleStave.addTimeSignature(timeSig); } catch (_) {}
+                    }
+                }
+                if (barlinesMode === 'none') {
+                    try { trebleStave.setBegBarType(barlineNone); trebleStave.setEndBarType(barlineNone); } catch (_) {}
+                    try { bassStave.setBegBarType(barlineNone); bassStave.setEndBarType(barlineNone); } catch (_) {}
+                }
+                trebleStave.setContext(ctx).draw();
+                bassStave.setContext(ctx).draw();
+                if (!firstTrebleStave) firstTrebleStave = trebleStave;
+                lastBassStave = bassStave;
+
+                const trebleData = satbChordSliceToNotes(mm.chords, 'treble');
+                const bassData = satbChordSliceToNotes(mm.chords, 'bass');
+                const drawVoice = (stave, clef, notesData) => {
+                    if (!notesData.length) return null;
+                    const staveNotes = notesData.map(n => buildStaveNote(VF, clef, n, keySig));
+                    const voiceBeats = barlinesMode === 'auto'
+                        ? numBeats
+                        : Math.max(notesData.reduce((s, n) => s + noteDurationBeats(n.duration, beatValue), 0), 1e-3);
+                    const voice = new VF.Voice({ num_beats: voiceBeats, beat_value: beatValue });
+                    if (typeof voice.setStrict === 'function') voice.setStrict(false);
+                    voice.addTickables(staveNotes);
+                    staveNotes.forEach(sn => { try { sn.setStave(stave); } catch (_) {} });
+                    const overhead = mm.isFirstOfRow ? FIRST_OVERHEAD : 30;
+                    const formatWidth = Math.max(mm.width - overhead, 50);
+                    const formatter = new VF.Formatter();
+                    formatter.joinVoices([voice]).format([voice], formatWidth);
+                    staveNotes.forEach(sn => applyNoteAccidentals(sn, VF));
+                    formatter.joinVoices([voice]).format([voice], formatWidth);
+                    voice.draw(ctx, stave);
+                    return { staveNotes, notesData, stave, clef };
+                };
+
+                const trebleDrawn = drawVoice(trebleStave, 'treble', trebleData);
+                const bassDrawn = drawVoice(bassStave, 'bass', bassData);
+                if (trebleDrawn) unisonBatch.push(trebleDrawn);
+                if (bassDrawn) unisonBatch.push(bassDrawn);
+                x += mm.width;
+            });
+
+            if (firstTrebleStave && lastBassStave && VF.StaveConnector) {
+                try {
+                    const brace = new VF.StaveConnector(firstTrebleStave, lastBassStave);
+                    if (VF.StaveConnector.type && VF.StaveConnector.type.BRACE != null) {
+                        brace.setType(VF.StaveConnector.type.BRACE);
+                    }
+                    brace.setContext(ctx).draw();
+                } catch (_) {}
+            }
+        });
+
+        const svg = container.querySelector('svg');
+        unisonBatch.forEach(({ staveNotes, notesData, stave, clef }) => {
+            try { expandUnisonHeads(staveNotes, notesData, clef, svg, noteColor, stave); } catch (_) {}
+            try { drawChordLabelsBelow(svg, stave, staveNotes, notesData, noteColor); } catch (_) {}
+        });
+
+        if (svg) {
+            svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+            svg.querySelectorAll('path, rect, line, ellipse, polygon').forEach(el => {
+                const fill = el.getAttribute('fill');
+                if (fill && fill !== 'none') el.setAttribute('fill', noteColor);
+                const stroke = el.getAttribute('stroke');
+                if (stroke && stroke !== 'none') el.setAttribute('stroke', noteColor);
+            });
+            svg.querySelectorAll('text').forEach(el => el.setAttribute('fill', noteColor));
+        }
+    } catch (err) {
+        console.error('[Solf.ai] SATB VexFlow render error:', err);
+        container.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationRenderFailed', { chat: true, fallback: 'Could not render notation' })}: ${err.message || err}</div>`;
+    }
+}
+
+function renderNotationCard(container, data) {
+    data = normalizeNotationLayout(data);
+    if (window.SolfTheory && typeof window.SolfTheory.sanitizeNotationData === 'function') {
+        try {
+            const cleaned = window.SolfTheory.sanitizeNotationData(data);
+            // null = после чистки рисовать нечего (мусорные ноты). Лучше аккуратное
+            // сообщение, чем упавший рендер или ноты друг на друге.
+            if (!cleaned) {
+                container.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationRenderFailed', { chat: true, fallback: 'Could not render notation' })}</div>`;
+                return;
+            }
+            data = cleaned;
+        } catch (_) { }
+    }
+    if (!data || typeof data !== 'object') return;
+    if (data.layout === 'satb') {
+        renderSatbNotationCard(container, data);
+        return;
+    }
+    const VF = getVexFlowNamespace();
+    if (!VF) {
+        container.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationEngineNotLoaded', { chat: true, fallback: 'Music engine not loaded' })}</div>`;
+        return;
+    }
+    container.innerHTML = '';
+
+    try {
+        const isLight = document.documentElement.getAttribute('data-theme') === 'light';
+        const noteColor = isLight ? '#1a1a2e' : '#e6e6f0';
+
+        // Авто-подписи: проставляем label каждому интервалу/аккорду, у которого его ещё нет
+        // (например, блок сгенерировала сама модель). Готовые подписи не трогаем.
+        if (window.SolfTheory && typeof window.SolfTheory.autoLabelNotation === 'function') {
+            try {
+                const labelLang = window.__solfaiResponseLang
+                    || (typeof currentLang === 'string' && currentLang)
+                    || localStorage.getItem('solfai_lang')
+                    || 'en';
+                if (typeof window.SolfTheory.setLabelLocale === 'function') {
+                    window.SolfTheory.setLabelLocale(labelLang);
+                }
+                window.SolfTheory.autoLabelNotation(data);
+            } catch (_) {}
+        }
+
+        const clef = (data.clef === 'bass') ? 'bass' : 'treble';
+        const keySig = normalizeKeySignature(typeof data.keySignature === 'string' ? data.keySignature : 'C');
+        const rawTimeSig = typeof data.timeSignature === 'string' ? data.timeSignature.trim() : '4/4';
+        let rawNotes = Array.isArray(data.notes) ? data.notes : [];
+        if (!data.lockOctaves) {
+            if (window.SolfTheory && typeof window.SolfTheory.normalizeNotationOctaves === 'function') {
+                try { rawNotes = window.SolfTheory.normalizeNotationOctaves(rawNotes, clef); } catch (_) {}
+            } else {
+                rawNotes = normalizeNotationOctavesLocal(rawNotes, clef);
+            }
+        }
+
+        const barlinesMode = (['none', 'manual', 'auto'].includes(data.barlines)) ? data.barlines : 'auto';
+        const timeSigHidden = !rawTimeSig || rawTimeSig === 'none' || barlinesMode !== 'auto';
+        const timeSig = timeSigHidden ? '4/4' : rawTimeSig;
+
+        const tsParts = timeSig.split('/');
+        const numBeats = Math.max(parseInt(tsParts[0], 10) || 4, 1);
+        const beatValue = Math.max(parseInt(tsParts[1], 10) || 4, 1);
+
+        const measures = groupNotesIntoSegments(rawNotes, barlinesMode, numBeats, beatValue);
+        const barlineNone = getBarlineNoneType(VF);
+
+        const containerW = container.clientWidth || container.parentElement?.clientWidth || 600;
+        const hasLabels = rawNotes.some(n => n && n.label);
+        const preferSingleLine = (barlinesMode === 'manual' && measures.length <= 6)
+            || (barlinesMode === 'none' && rawNotes.length <= 12);
+        const maxW = preferSingleLine
+            ? Math.max(containerW - 16, 520)
+            : Math.min(Math.max(containerW - 16, 280), 960);
+
+        const FIRST_OVERHEAD = 100;
+        const NEXT_OVERHEAD = 14;
+        const PER_NOTE = hasLabels ? 40 : 28;
+        const MIN_MEASURE = hasLabels ? 100 : 88;
+        const measureBaseW = m => Math.max(MIN_MEASURE, m.length * PER_NOTE + 22);
+
+        // Раскладка тактов по строкам с переносом
+        let rows = [];
+        if (preferSingleLine && measures.length) {
+            rows = [measures.map((m, i) => ({
+                notes: m,
+                width: (i === 0 ? FIRST_OVERHEAD : NEXT_OVERHEAD) + measureBaseW(m),
+                isFirstOfRow: i === 0
+            }))];
+        } else {
+            let row = [];
+            let rowW = 0;
+            measures.forEach(m => {
+                const isFirstOfRow = row.length === 0;
+                const overhead = isFirstOfRow ? FIRST_OVERHEAD : NEXT_OVERHEAD;
+                const w = measureBaseW(m) + overhead;
+                if (!isFirstOfRow && rowW + w > maxW) {
+                    rows.push(row);
+                    row = [{ notes: m, width: FIRST_OVERHEAD + measureBaseW(m), isFirstOfRow: true }];
+                    rowW = FIRST_OVERHEAD + measureBaseW(m);
+                } else {
+                    row.push({ notes: m, width: w, isFirstOfRow });
+                    rowW += w;
+                }
+            });
+            if (row.length) rows.push(row);
+        }
+
+        // Растягиваем строки до всей доступной ширины
+        rows.forEach(r => {
+            const total = r.reduce((s, mm) => s + mm.width, 0);
+            const slack = Math.max(0, maxW - total);
+            if (slack > 0) {
+                const totalNotes = r.reduce((s, mm) => s + Math.max(mm.notes.length, 1), 0);
+                r.forEach(mm => {
+                    const share = Math.round(slack * (Math.max(mm.notes.length, 1) / totalNotes));
+                    mm.width += share;
+                });
+            }
+        });
+
+        const ROW_HEIGHT = 132;
+        const TOP_PAD = 12;
+        const totalHeight = rows.length * ROW_HEIGHT + TOP_PAD + 32;
+        const rowPixelW = rows.reduce((mx, r) => Math.max(mx, r.reduce((s, mm) => s + mm.width, 0)), 0);
+        const totalWidth = Math.max(maxW + 16, rowPixelW + 16);
+
+        const renderer = new VF.Renderer(container, VF.Renderer.Backends.SVG);
+        renderer.resize(totalWidth, totalHeight);
+        const ctx = renderer.getContext();
+        if (typeof ctx.setFillStyle === 'function') ctx.setFillStyle(noteColor);
+        if (typeof ctx.setStrokeStyle === 'function') ctx.setStrokeStyle(noteColor);
+
+        rows.forEach((r, rowIdx) => {
+            let x = 8;
+            const y = TOP_PAD + rowIdx * ROW_HEIGHT;
+            const unisonBatch = [];
+            r.forEach((mm, mIdx) => {
+                const stave = new VF.Stave(x, y, mm.width);
+                if (mm.isFirstOfRow) {
+                    try { stave.addClef(clef); } catch (_) {}
+                    try { stave.addKeySignature(keySig); } catch (_) {}
+                    if (rowIdx === 0 && mIdx === 0 && !timeSigHidden) {
+                        try { stave.addTimeSignature(timeSig); } catch (_) {}
+                    }
+                }
+
+                if (barlinesMode === 'none') {
+                    try { stave.setBegBarType(barlineNone); } catch (_) {}
+                    try { stave.setEndBarType(barlineNone); } catch (_) {}
+                }
+
+                stave.setContext(ctx).draw();
+
+                if (mm.notes.length) {
+                    const staveNotes = mm.notes.map(n => buildStaveNote(VF, clef, n, keySig));
+                    const voiceBeats = barlinesMode === 'auto'
+                        ? numBeats
+                        : Math.max(
+                            mm.notes.reduce((s, n) => s + noteDurationBeats(n.duration, beatValue), 0),
+                            1e-3
+                        );
+                    const voice = new VF.Voice({ num_beats: voiceBeats, beat_value: beatValue });
+                    if (typeof voice.setStrict === 'function') voice.setStrict(false);
+                    voice.addTickables(staveNotes);
+                    staveNotes.forEach(sn => { try { sn.setStave(stave); } catch (_) {} });
+                    const overhead = mm.isFirstOfRow ? FIRST_OVERHEAD : 30;
+                    const formatWidth = Math.max(mm.width - overhead, 50);
+                    const formatter = new VF.Formatter();
+                    formatter.joinVoices([voice]).format([voice], formatWidth);
+                    staveNotes.forEach(sn => applyNoteAccidentals(sn, VF));
+                    formatter.joinVoices([voice]).format([voice], formatWidth);
+                    voice.draw(ctx, stave);
+                    unisonBatch.push({ staveNotes, notesData: mm.notes, stave });
+                }
+
+                x += mm.width;
+            });
+            const svg = container.querySelector('svg');
+            unisonBatch.forEach(({ staveNotes, notesData, stave }) => {
+                try { expandUnisonHeads(staveNotes, notesData, clef, svg, noteColor, stave); } catch (_) {}
+                try { drawChordLabelsBelow(svg, stave, staveNotes, notesData, noteColor); } catch (_) {}
+            });
+        });
+
+        // Перекрашиваем уже отрисованный SVG в цвет темы
+        const svg = container.querySelector('svg');
+        if (svg) {
+            svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+            svg.querySelectorAll('path, rect, line, ellipse, polygon').forEach(el => {
+                const fill = el.getAttribute('fill');
+                if (fill && fill !== 'none') el.setAttribute('fill', noteColor);
+                const stroke = el.getAttribute('stroke');
+                if (stroke && stroke !== 'none') el.setAttribute('stroke', noteColor);
+            });
+            svg.querySelectorAll('text').forEach(el => el.setAttribute('fill', noteColor));
+        }
+    } catch (err) {
+        console.error('[Solf.ai] VexFlow render error:', err);
+        container.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationRenderFailed', { chat: true, fallback: 'Could not render notation' })}: ${err.message || err}</div>`;
+    }
+}
+
+window.copyAiMessage = async function(button) {
+    const messageContent = button?.closest('.message-body')?.querySelector('.message-content');
+    if (!messageContent) return;
+    try {
+        await navigator.clipboard.writeText(messageContent.innerText.trim());
+        button.classList.add('copied');
+        setTimeout(() => button.classList.remove('copied'), 1000);
+    } catch (_) {
+        showToast(uiText('copyFailed', { fallback: 'Copy failed' }), 'error');
+    }
+};
+
+function showTypingIndicator(forChatId = currentChatId) {
+    const targetChatId = forChatId != null ? String(forChatId) : (currentChatId != null ? String(currentChatId) : '');
+    if (!targetChatId || String(currentChatId) !== targetChatId) return;
+
+    const existing = document.getElementById('typingIndicator');
+    if (existing) {
+        if (existing.dataset.chatId === targetChatId) return;
+        existing.remove();
+    }
+
+    const div = document.createElement('div');
+    div.className = 'message message-ai';
+    div.id = 'typingIndicator';
+    div.dataset.chatId = targetChatId;
+    div.innerHTML = `<div class="message-avatar"><svg class="svg-icon" viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"></path><circle cx="6" cy="18" r="3"></circle><circle cx="18" cy="16" r="3"></circle></svg></div><div class="message-content"><div class="typing-indicator"><div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div></div></div>`;
+    chatMessages.appendChild(div);
+    scrollToBottom(true);
+}
+
+function removeTypingIndicator(forChatId = null) {
+    const el = document.getElementById('typingIndicator');
+    if (!el) return;
+    if (forChatId && el.dataset.chatId && el.dataset.chatId !== String(forChatId)) return;
+    el.remove();
+}
+
+function resetGeneratingUi() {
+    isGenerating = false;
+    generatingChatId = null;
+    userAbortedGeneration = false;
+    currentAbortController = null;
+    renderChatsList();
+    if (chatSendBtn) {
+        applyIdleSendButtonState();
+    }
+}
+
+/**
+ * Сохраняет ответ AI в чат, где был задан вопрос.
+ * В UI рисует только если пользователь всё ещё смотрит этот чат.
+ */
+async function deliverAiReplyToChat(chatId, text, { withTyping = true } = {}) {
+    removeTypingIndicator(chatId);
+    const chat = chats.find(c => c.id === chatId);
+    const msgId = Date.now().toString();
+    if (chat) {
+        chat.messages.push({
+            role: 'ai',
+            content: text,
+            time: new Date().toISOString(),
+            id: msgId
+        });
+        saveChatToStorage();
+    }
+    if (currentChatId === chatId) {
+        await addMessageToUI('ai', text, [], withTyping, msgId);
+    }
+}
+
+async function generateResponse(query, imageData = null) {
+    if (getRemainingRequests() <= 0) { showNoRequestsToast(); refreshSendButtonState(); return; }
+    if (imageData && getRemainingImages() <= 0) { 
+        refreshImageAttachVisibility();
+        showImageLimitModal(); 
+        attachedFiles = []; 
+        if (typeof chatAttachedFiles !== 'undefined') chatAttachedFiles.innerHTML = ''; 
+        return; 
+    }
+    if (isHarmonizationTask(query, !!imageData) && !notationModeEnabled) {
+        try {
+            showToast(
+                uiText('harmonizeNeedsNotation', { fallback: 'Turn on Notation mode for harmonization' }),
+                'info',
+                { dedupeKey: 'harmonize-notation' }
+            );
+        } catch (_) {}
+    }
+    if (isGenerating) return; 
+
+    // Чат, куда уйдёт ответ — фиксируем ДО любых await (иначе New Chat перехватит ответ)
+    const replyChatId = currentChatId;
+
+    isGenerating = true;
+    generatingChatId = replyChatId;
+    userAbortedGeneration = false;
+    generationStartedAt = Date.now();
+    currentAbortController = new AbortController();
+    renderChatsList();
+    applyGeneratingSendButtonState();
+    
+    showTypingIndicator(replyChatId);
+
+    // Восстанавливаем абзацы: склеенный список модель читает как один сплошной абзац
+    // и отвечает только на его начало.
+    const baseUserContent = normalizeQueryForAnalysis(query) || 'Analyze image';
+    const replyChat = chats.find(c => c.id === replyChatId);
+    const responseLang = detectResponseLanguage(query, replyChat?.messages);
+    window.__solfaiResponseLang = responseLang;
+    if (window.SolfTheory && typeof window.SolfTheory.setLabelLocale === 'function') {
+        window.SolfTheory.setLabelLocale(responseLang);
+    }
+
+    const harmonizationTask = isHarmonizationTask(baseUserContent, !!imageData);
+    const chainTask = isChainTask(baseUserContent);
+    // Типовую Цепочку 1/2 строит движок детерминированно — правила четырёхголосия ей не нужны,
+    // а слово «K64» в списке аккордов иначе принимало бы её за задачу по гармонии.
+    // Цепочка, выписанная пользователем, — наоборот, полноценная задача по гармонии.
+    const cannedChainTask = chainTask && !extractExplicitChordChain(baseUserContent);
+    const harmonyCourseTask = !cannedChainTask && isHarmonyCourseTask(baseUserContent);
+    const compositeBuildTask = isCompositeBuildQuery(baseUserContent);
+    const multiTopicTask = isMultiTopicQuery(baseUserContent);
+    const usageType = imageData ? 'image' : 'request';
+
+    // ——— БЫСТРЫЕ ОТВЕТЫ (theory.js) ———
+    // Считаем и отдаём СРАЗУ. Списание в БД — в фоне: await /increment-usage
+    // раньше стоял ПЕРЕД выдачей и при любом сбое/429 убивал весь быстрый путь.
+    let instantReplyText = null;
+    try {
+        const theoryQuick = (harmonizationTask || imageData || compositeBuildTask || multiTopicTask)
+            ? null
+            : queryTheoryQuickAnswer(baseUserContent);
+        if (theoryQuick?.text) {
+            instantReplyText = theoryQuick.text;
+        } else if (!multiTopicTask && canAnswerFromTheoryOnly(baseUserContent, { harmonizationTask, hasImage: !!imageData })) {
+            instantReplyText = patchAiWithTheory(baseUserContent, '') || null;
+        }
+    } catch (theoryErr) {
+        console.warn('[Solf.ai] instant theory path failed:', theoryErr);
+    }
+
+    if (instantReplyText) {
+        // Локально сразу −1, в БД — fire-and-forget (атомарный increment на сервере)
+        if (isUserLoggedIn()) {
+            useRequest();
+            if (imageData) useImage();
+            consumeUsageOnServer(usageType).catch(err => {
+                console.warn('[Solf.ai] background usage charge failed:', err);
+            });
+        } else {
+            useRequest();
+            if (imageData) useImage();
+        }
+        await delayQuickReplyFeel();
+        await deliverInstantAiReply(instantReplyText, replyChatId);
+        return;
+    }
+
+    // ——— МЕДЛЕННЫЙ ПУТЬ (Gemini) ———
+    // Здесь ждём списание: платный API, нужна жёсткая проверка лимита
+    let usageChargedOnServer = false;
+    try {
+        if (isUserLoggedIn()) {
+            const charged = await consumeUsageOnServer(usageType);
+            usageChargedOnServer = Boolean(charged);
+            if (!usageChargedOnServer) {
+                useRequest();
+                if (imageData) useImage();
+            }
+        } else {
+            useRequest();
+            if (imageData) useImage();
+        }
+    } catch (limitErr) {
+        removeTypingIndicator(replyChatId);
+        resetGeneratingUi();
+        if (limitErr?.code === 'LIMIT_IMAGES' || limitErr?.status === 403) {
+            showImageLimitModal();
+        } else {
+            showNoRequestsToast();
+        }
+        return;
+    }
+    
+    try {
+        const chat = replyChat || chats.find(c => c.id === replyChatId);
+        // responseLang / locale уже выставлены выше
+
+        const messages = [{ role: 'system', content: getSystemInstruction(responseLang, query) }];
+        
+        const freshBuildTask = notationModeEnabled && (isBuildTask(baseUserContent) || harmonizationTask || chainTask || compositeBuildTask);
+
+        if (chat) {
+            // ИСКЛЮЧАЕМ самое последнее сообщение из истории (оно уже добавлено в UI, но мы передадим его ниже)
+            // Это решает проблему ошибки API при первом сообщении.
+            //
+            // «Прочистка памяти» для build-задач: не передаём ответы ассистента — они часто
+            // содержат урезанные/ошибочные построения, и модель начинает их копировать.
+            // Оставляем только последние 2 user-сообщения (язык + контекст тональности).
+            let history = chat.messages.slice(-11, -1);
+            if (freshBuildTask) {
+                history = history.filter(m => m.role === 'user').slice(-2);
+            }
+            history.forEach(msg => {
+                const content = notationModeEnabled
+                    ? (msg.content || '')
+                    : stripNotationBlocks(msg.content || '');
+                messages.push({ role: msg.role === 'user' ? 'user' : 'assistant', content });
+            });
+        }
+        
+        // Базовое содержимое user-сообщения. При включённом режиме нотации — добавляем
+        // невидимый ремайндер, который сильно повышает шанс, что модель не забудет блок.
+        const requestedParts = countRequestedParts(baseUserContent);
+        const multiPartReminder = (requestedParts >= 2 || compositeBuildTask || multiTopicTask)
+            ? buildMultiPartReminder(baseUserContent, responseLang, Math.max(requestedParts, 2))
+            : '';
+        const harmonyReminder = harmonyCourseTask ? buildHarmonyRulesReminder(responseLang) : '';
+        let apiUserContent = notationModeEnabled
+            ? `${baseUserContent}${buildNotationUserReminder(responseLang, { multiPart: requestedParts })}${multiPartReminder}${freshBuildTask ? buildFreshTaskReminder(baseUserContent, responseLang) : ''}${harmonizationTask ? buildHarmonizationReminder(responseLang, !!imageData) : ''}${harmonyReminder}${chainTask ? buildChainReminder(responseLang, baseUserContent) : ''}`
+            : `${baseUserContent}${multiPartReminder}${harmonyReminder}`;
+        messages.push({ role: 'user', content: apiUserContent });
+
+        // Эталонный блок берём только когда он закрывает ВЕСЬ запрос. На многосоставном
+        // задании движок узнаёт в лучшем случае один фрагмент («хроматизм» + «си мажор» =
+        // хроматическая гамма), подставить его нельзя — а само его наличие отключало
+        // авто-ретрай «модель забыла нотацию», и ответ оставался вообще без нот.
+        const singlePartTask = requestedParts < 2 && !compositeBuildTask && !multiTopicTask;
+        const theoryDet = singlePartTask ? queryTheoryNotation(baseUserContent) : null;
+        const deterministicBlock = theoryDet?.blockString || null;
+
+        // Бюджет токенов. Большие задачи (цепочки аккордов на 15+ строк, гармонизации,
+        // диктанты, модуляции) требуют много выходных токенов — иначе длинный нотный блок обрежется.
+        // isBigNotationTask() / isHarmonizationTask() поднимают лимит до 8192.
+        const bigTask = notationModeEnabled && (isBigNotationTask(baseUserContent) || harmonizationTask || harmonyCourseTask || chainTask || compositeBuildTask || multiTopicTask);
+        const tokenBudget = notationModeEnabled
+            ? (bigTask ? 8192 : 2048)
+            : (harmonizationTask || harmonyCourseTask || multiTopicTask ? 4096 : 1024);
+        const payload = {
+            userId: currentUser?.id,
+            // Уже списали через /increment-usage (в т.ч. для theory-only ответов)
+            usageAlreadyCounted: usageChargedOnServer,
+            // В модель — только текст/картинка; name/email профиля не отправляем. Email/телефон в тексте маскируем.
+            messages: sanitizeMessagesForModel(messages),
+            temperature: notationModeEnabled
+                ? ((freshBuildTask || harmonizationTask || harmonyCourseTask || chainTask) ? 0.35 : 0.45)
+                : (harmonyCourseTask ? 0.4 : 0.7),
+            max_tokens: tokenBudget,
+            maxOutputTokens: tokenBudget,
+            image: imageData ? {
+                mime_type: imageData.match(/data:(.*?);/)?.[1] || 'image/jpeg',
+                data: imageData.includes(',') ? imageData.split(',')[1] : imageData
+            } : null
+        };
+
+        const requestTimeoutMs = imageData ? 90000 : 60000;
+        const res = await apiFetch(`${WORKER_URL}/generate`, { 
+            method: 'POST', 
+            headers: { 'Content-Type': 'application/json' }, 
+            body: JSON.stringify(payload), 
+            signal: currentAbortController.signal 
+        }, requestTimeoutMs);
+
+        const data = await res.json();
+        if (!res.ok || data.error) {
+            console.error('Server error:', data);
+            if (data.usage) applyUsageFromServer(data.usage);
+            if (res.status === 429 || data.code === 'LIMIT_REQUESTS') {
+                if (!usageChargedOnServer) {
+                    rollbackRequestUsage();
+                    if (imageData) rollbackImageUsage();
+                }
+                showNoRequestsToast();
+                return;
+            }
+            if ((res.status === 429 || res.status === 403) && data.code === 'LIMIT_IMAGES') {
+                if (!usageChargedOnServer) {
+                    rollbackRequestUsage();
+                    rollbackImageUsage();
+                }
+                showImageLimitModal();
+                return;
+            }
+            const detailedError = data.message || data.error?.message || data.error || 'API Error';
+            throw new Error(detailedError);
+        }
+
+        let aiText = data.text || data.choices?.[0]?.message?.content || 'Empty response';
+
+        // === Защита от записи нот при ВЫКЛЮЧЕННОЙ кнопке ===
+        // Если модель по инерции выдала [[NOTATION:...]] (например, из-за длинной истории),
+        // удаляем блок ДО сохранения в chat.messages — чтобы он не оседал в БД и не
+        // всплывал при перезаходе в чат. Старые сохранённые блоки это не трогает.
+        if (!notationModeEnabled && hasNotationBlock(aiText)) {
+            aiText = stripNotationBlocks(aiText).trim();
+        }
+
+        // Детерминированная нотация: один lookup theory.js на запрос (ретраи пропускаем, если блок уже есть).
+        // theoryDet вычислен выше до API; здесь только подстановка в ответ.
+        const theoryDetFinal = theoryDet;
+        const deterministicBlockFinal = deterministicBlock;
+
+        // Silent auto-retry, если режим нотации включён, а модель «забыла» блок.
+        if (notationModeEnabled && !deterministicBlockFinal && !hasNotationBlock(aiText)) {
+            const truncated = hasTruncatedNotationStart(aiText);
+            const cleanedAiText = truncated ? stripTruncatedNotationTail(aiText) : aiText;
+            // Если блок был обрезан — стартуем сразу с "только-JSON" промпта,
+            // чтобы не дёргать модель лишний раз тяжелыми инструкциями.
+            const notationRetryPrompts = truncated
+                ? [NOTATION_RETRY_PROMPT_3, NOTATION_RETRY_PROMPT_3, NOTATION_RETRY_PROMPT_2]
+                : [NOTATION_RETRY_PROMPT, NOTATION_RETRY_PROMPT_2, NOTATION_RETRY_PROMPT_3];
+            const notationRetryTemps = truncated ? [0.1, 0.05, 0.15] : [0.25, 0.12, 0.05];
+            const notationRetryBudgets = [2048, 3072, 4096];
+            try {
+                for (let ri = 0; ri < notationRetryPrompts.length && !hasNotationBlock(aiText); ri++) {
+                    const retryMessages = messages.concat([
+                        { role: 'assistant', content: cleanedAiText || ' ' },
+                        { role: 'user', content: notationRetryPrompts[ri] }
+                    ]);
+                    const retryBudget = notationRetryBudgets[ri] ?? 2048;
+                    const retryRes = await apiFetch(`${WORKER_URL}/generate`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            userId: currentUser?.id,
+                            usageAlreadyCounted: true,
+                            messages: sanitizeMessagesForModel(retryMessages),
+                            temperature: notationRetryTemps[ri] ?? 0.15,
+                            max_tokens: retryBudget,
+                            maxOutputTokens: retryBudget,
+                            image: null
+                        }),
+                        signal: currentAbortController.signal
+                    }, requestTimeoutMs);
+                    const retryData = await retryRes.json().catch(() => ({}));
+                    if (retryRes.ok && !retryData.error) {
+                        const retryText = retryData.text || retryData.choices?.[0]?.message?.content || '';
+                        if (hasNotationBlock(retryText)) {
+                            // Если был обрезанный случай — сшиваем «чистый» исходный текст
+                            // с пришедшим блоком, чтобы пользователь увидел нормальное объяснение
+                            // плюс рендер. В остальных случаях просто берём ответ ретрая целиком.
+                            if (truncated && cleanedAiText) {
+                                const blockMatch = retryText.match(NOTATION_BLOCK_RE);
+                                aiText = blockMatch
+                                    ? `${cleanedAiText}\n${blockMatch[0]}`.trim()
+                                    : retryText;
+                            } else {
+                                aiText = retryText;
+                            }
+                            break;
+                        }
+                    }
+                }
+            } catch (retryErr) {
+                if (retryErr?.name !== 'AbortError') {
+                    console.warn('[Solf.ai] Notation auto-retry failed:', retryErr);
+                }
+            }
+        }
+
+        // Гармонизация: модель часто выдаёт один демо-аккорд — переспрашиваем с картинкой.
+        if (notationModeEnabled && harmonizationTask && hasNotationBlock(aiText) && countNotationChords(aiText) < 4) {
+            const imagePayload = imageData ? {
+                mime_type: imageData.match(/data:(.*?);/)?.[1] || 'image/jpeg',
+                data: imageData.includes(',') ? imageData.split(',')[1] : imageData
+            } : null;
+            try {
+                for (let hi = 0; hi < 2 && countNotationChords(aiText) < 4; hi++) {
+                    const harmRetryRes = await apiFetch(`${WORKER_URL}/generate`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            userId: currentUser?.id,
+                            usageAlreadyCounted: true,
+                            messages: sanitizeMessagesForModel(messages.concat([
+                                { role: 'assistant', content: aiText },
+                                { role: 'user', content: `${HARMONIZATION_RETRY_PROMPT}${buildHarmonizationReminder(responseLang, !!imageData)}` }
+                            ])),
+                            temperature: 0.2,
+                            max_tokens: 8192,
+                            maxOutputTokens: 8192,
+                            image: imagePayload
+                        }),
+                        signal: currentAbortController.signal
+                    }, requestTimeoutMs);
+                    const harmRetryData = await harmRetryRes.json().catch(() => ({}));
+                    if (harmRetryRes.ok && !harmRetryData.error) {
+                        const harmText = harmRetryData.text || harmRetryData.choices?.[0]?.message?.content || '';
+                        if (hasNotationBlock(harmText) && countNotationChords(harmText) >= countNotationChords(aiText)) {
+                            aiText = harmText;
+                        }
+                    }
+                }
+            } catch (harmErr) {
+                if (harmErr?.name !== 'AbortError') {
+                    console.warn('[Solf.ai] Harmonization auto-retry failed:', harmErr);
+                }
+            }
+        }
+
+        // Цепочка: модель часто выдаёт 1–3 аккорда вместо полной схемы — переспрашиваем.
+        if (notationModeEnabled && chainTask && !deterministicBlockFinal && hasNotationBlock(aiText)) {
+            const expectedLen = expectedChainLength(baseUserContent);
+            try {
+                for (let ci = 0; ci < 2 && countNotationChords(aiText) < expectedLen; ci++) {
+                    const chainRetryRes = await apiFetch(`${WORKER_URL}/generate`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({
+                            userId: currentUser?.id,
+                            usageAlreadyCounted: true,
+                            messages: sanitizeMessagesForModel(messages.concat([
+                                { role: 'assistant', content: aiText },
+                                { role: 'user', content: `${CHAIN_RETRY_PROMPT}${buildChainReminder(responseLang, baseUserContent)}` }
+                            ])),
+                            temperature: 0.2,
+                            max_tokens: 8192,
+                            maxOutputTokens: 8192,
+                            image: null
+                        }),
+                        signal: currentAbortController.signal
+                    }, requestTimeoutMs);
+                    const chainRetryData = await chainRetryRes.json().catch(() => ({}));
+                    if (chainRetryRes.ok && !chainRetryData.error) {
+                        const chainText = chainRetryData.text || chainRetryData.choices?.[0]?.message?.content || '';
+                        if (hasNotationBlock(chainText) && countNotationChords(chainText) >= countNotationChords(aiText)) {
+                            aiText = chainText;
+                        }
+                    }
+                }
+            } catch (chainErr) {
+                if (chainErr?.name !== 'AbortError') {
+                    console.warn('[Solf.ai] Chain auto-retry failed:', chainErr);
+                }
+            }
+        }
+
+        // Готовый блок из theory.js подставляем, только когда он закрывает ВЕСЬ запрос:
+        // patchAiWithTheory заменяет ответ целиком, и на многосоставном задании это
+        // оставляло от ответа один первый пункт.
+        if (!harmonizationTask && requestedParts < 2 && !multiTopicTask) {
+            aiText = patchAiWithTheory(baseUserContent, aiText, theoryDetFinal ?? queryTheoryNotation(baseUserContent));
+        }
+
+        removeTypingIndicator(replyChatId);
+        if (data.usage) {
+            applyUsageFromServer(data.usage);
+        }
+        await deliverAiReplyToChat(replyChatId, aiText, { withTyping: true });
+        
+    } catch (e) {
+        removeTypingIndicator(replyChatId);
+        // Возврат попытки ТОЛЬКО при сбое ИИ / таймауте / ошибке.
+        // Ручной стоп (userAbortedGeneration) — попытка сгорает, не возвращаем.
+        const isUserStop = e.name === 'AbortError' && userAbortedGeneration;
+        if (!isUserStop) {
+            if (usageChargedOnServer) {
+                await refundUsageOnServer(usageType);
+            } else {
+                rollbackRequestUsage();
+                if (imageData) rollbackImageUsage();
+            }
+        }
+        if (e.name === 'AbortError') {
+            if (userAbortedGeneration) {
+                await deliverAiReplyToChat(
+                    replyChatId,
+                    `🛑 ${uiText('chatStopped', { chat: true, fallback: 'Stopped.' })}`,
+                    { withTyping: false }
+                );
+            } else {
+                await deliverAiReplyToChat(
+                    replyChatId,
+                    `❌ ${uiText('chatTimeout', { chat: true, fallback: 'Request timed out. Try again.' })}`,
+                    { withTyping: false }
+                );
+            }
+        } else {
+            await deliverAiReplyToChat(
+                replyChatId,
+                `❌ ${uiText('chatError', { chat: true, fallback: 'Error' })}: ${e.message}`,
+                { withTyping: false }
+            );
+        }
+    } finally {
+        resetGeneratingUi();
+    }
+}
+function showLoginPrompt() {
+    if (pendingQuery) {
+        try {
+            sessionStorage.setItem('solfai_pending_query', JSON.stringify(pendingQuery));
+        } catch (_) {}
+    }
+    navigateToLogin();
+}
+
+function restorePendingQueryAfterLogin() {
+    if (!currentUser) return;
+    try {
+        const raw = sessionStorage.getItem('solfai_pending_query');
+        if (!raw) return;
+        const pq = JSON.parse(raw);
+        sessionStorage.removeItem('solfai_pending_query');
+        if (pq?.query) proceedWithQuery(pq.query, pq.imageData);
+    } catch (_) {}
+}
+
+function shouldAutoFocusChatInput() {
+    if (sessionStorage.getItem('solfai_skip_focus_once') === '1') return false;
+    if (isMobileLayout()) return false;
+    if (isBlockingOverlayActive()) return false;
+    return true;
+}
+
+function stealFocusWithSink() {
+    const sink = document.createElement('button');
+    sink.type = 'button';
+    sink.setAttribute('tabindex', '-1');
+    sink.setAttribute('aria-hidden', 'true');
+    Object.assign(sink.style, {
+        position: 'fixed',
+        width: '1px',
+        height: '1px',
+        padding: '0',
+        margin: '0',
+        opacity: '0',
+        pointerEvents: 'none',
+        border: 'none',
+        left: '0',
+        bottom: '0',
+    });
+    document.body.appendChild(sink);
+    try {
+        sink.focus({ preventScroll: true });
+    } catch (_) {
+        sink.focus();
+    }
+    sink.blur();
+    sink.remove();
+}
+
+function dismissChatInputFocus() {
+    chatInput?.blur?.();
+    document.activeElement?.blur?.();
+    if (isMobileLayout()) stealFocusWithSink();
+}
+
+function armChatInputReadonlyUntilInteraction() {
+    if (!chatInput || chatInput.dataset.readonlyArmed === '1') return;
+    chatInput.dataset.readonlyArmed = '1';
+    const prevInputmode = chatInput.getAttribute('inputmode');
+    chatInput.setAttribute('readonly', 'readonly');
+    chatInput.setAttribute('inputmode', 'none');
+    const disarm = () => {
+        delete chatInput.dataset.readonlyArmed;
+        chatInput.removeAttribute('readonly');
+        if (prevInputmode == null || prevInputmode === '') chatInput.removeAttribute('inputmode');
+        else chatInput.setAttribute('inputmode', prevInputmode);
+    };
+    chatInput.addEventListener('pointerdown', disarm, { once: true, capture: true });
+    chatInput.addEventListener('touchstart', disarm, { once: true, passive: true, capture: true });
+    setTimeout(disarm, 8000);
+}
+
+/** Снять фокус и заблокировать подъём клавиатуры на iOS до следующего тапа в поле. */
+function dismissMobileChatKeyboard() {
+    dismissChatInputFocus();
+    armChatInputReadonlyUntilInteraction();
+    requestAnimationFrame(dismissChatInputFocus);
+}
+
+function startNewChat(options = {}) {
+    closeAllOverlays();
+    cancelActiveTyping();
+    saveChatToStorage(); currentChatId = null; chatMessages.innerHTML = '';
+    chatTitle.textContent = (typeof solfaiGetText === 'function' ? solfaiGetText('newChat') : '') || 'New Chat';
+    chatInput.value = '';
+    if (options.focus === true && shouldAutoFocusChatInput()) {
+        chatInput.focus();
+    } else {
+        dismissChatInputFocus();
+    }
+    attachedFiles = []; chatAttachedFiles.innerHTML = ''; renderChatsList();
+    applyIdleSendButtonState();
+    if (isMobileLayout()) {
+        sidebar.classList.add('collapsed');
+        syncMobileSidebarDrawerState();
+    }
+}
+
+/** После возврата со страницы настроек: не поднимать клавиатуру (особенно iOS). */
+function scheduleSkipChatInputFocusCleanup() {
+    if (sessionStorage.getItem('solfai_skip_focus_once') !== '1') return;
+    let readonlyArmed = false;
+    const run = () => {
+        const input = document.getElementById('chatInput');
+        if (!input) return;
+        input.blur();
+        document.activeElement?.blur?.();
+        stealFocusWithSink();
+        if (readonlyArmed) return;
+        if (sessionStorage.getItem('solfai_skip_focus_once') !== '1') return;
+        readonlyArmed = true;
+        sessionStorage.removeItem('solfai_skip_focus_once');
+        armChatInputReadonlyUntilInteraction();
+    };
+    run();
+    requestAnimationFrame(run);
+    setTimeout(run, 0);
+    setTimeout(run, 120);
+    setTimeout(run, 350);
+    setTimeout(run, 600);
+}
+
+function proceedWithQuery(query, imageData) {
+    const clamped = clampChatMessage(query || '');
+    query = clamped.text;
+    if (!currentChatId) { createNewChat(query || 'Image'); chatTitle.textContent = (query || 'Image').slice(0, 30); }
+    const chat = chats.find(c => c.id === currentChatId);
+    window.__solfaiResponseLang = detectResponseLanguage(query, chat?.messages);
+    chatAttachedFiles.innerHTML = ''; chatInput.value = ''; chatInput.style.height = 'auto';
+    chat.messages.push({ role: 'user', content: query || 'Analyze', attachments: imageData ? [{ type: 'image/png', data: imageData }] : [], time: new Date().toISOString(), id: Date.now().toString() });
+    saveChatToStorage();
+    addMessageToUI('user', query || uiText('analyzeImage', { chat: true, fallback: 'Analyze image' }), imageData ? [{ type: 'image/png', data: imageData }] : []);
+    generateResponse(query, imageData); attachedFiles = [];
+    if (isMobileLayout()) dismissMobileChatKeyboard();
+}
+
+function sendChatMessage() {
+    let query = chatInput.value.trim();
+    const imageData = attachedFiles[0]?.data || null;
+    if (getRemainingRequests() <= 0) { showNoRequestsToast(); refreshSendButtonState(); return; }
+    if ((!query && !imageData) || isGenerating) return;
+
+    const clamped = clampChatMessage(query);
+    if (clamped.truncated) {
+        query = clamped.text;
+        chatInput.value = query;
+        showToast(
+            uiText('messageTooLong', {
+                fallback: `Message is too long. Max ${MAX_CHAT_MESSAGE_CHARS} characters.`
+            }),
+            'info',
+            { dedupeKey: 'msg-too-long' }
+        );
+    }
+
+    lastUserQuery = query;
+    if (!currentUser) { pendingQuery = { query, imageData }; showLoginPrompt(); return; }
+    proceedWithQuery(query, imageData);
+}
+
+function updateUIForUser(options = {}) {
+    if (currentUser) {
+        document.documentElement.classList.add('is-logged-in');
+
+        // Аватарка с lh3.googleusercontent.com может не загрузиться без VPN — на этот
+        // случай навешиваем onerror, который при сбое подменяет картинку на инициал имени.
+        // Так юзер не увидит "сломанный" `<img>`-плейсхолдер браузера.
+        const initial = (currentUser.name || currentUser.email || '?').trim().charAt(0).toUpperCase();
+        const picture = currentUser.picture || '';
+        const imgChat = document.getElementById('profileImgChat');
+        if (imgChat) {
+            imgChat.alt = initial;
+            imgChat.src = picture;
+            imgChat.onerror = () => { imgChat.removeAttribute('src'); imgChat.style.display = 'none'; };
+        }
+        document.getElementById('profileNameChat').textContent = (currentUser.name || '').split(' ')[0];
+        document.getElementById('profileFullNameChat').textContent = currentUser.name || '';
+        document.getElementById('profileEmailChat').textContent = currentUser.email || '';
+        // Sidebar avatar: если picture пустая или сломалась — показываем инициал поверх фона.
+        const sidebarAvatar = document.getElementById('userAvatarSidebar');
+        if (sidebarAvatar) {
+            if (picture) {
+                sidebarAvatar.innerHTML = `<img src="${picture}" alt="${initial}" onerror="this.parentElement.innerHTML='<span class=\\'avatar-initial\\'>${initial}</span>';" style="width:100%;height:100%;object-fit:cover; border-radius:50%;">`;
+            } else {
+                sidebarAvatar.innerHTML = `<span class="avatar-initial">${initial}</span>`;
+            }
+        }
+        document.getElementById('userNameSidebar').textContent = currentUser.name || '';
+    } else {
+        document.documentElement.classList.remove('is-logged-in');
+        document.documentElement.classList.remove('show-upgrade');
+    }
+    
+    // Сначала грузим кэш, чтобы интерфейс не дергался
+    if (!options.skipChatReload) {
+        chats = JSON.parse(localStorage.getItem(getChatsStorageKey()) || '[]');
+        updatePlanDisplay();
+        renderChatsList();
+        if (!currentChatId) startNewChat();
+        dismissChatInputFocus();
+        // Асинхронно подтягиваем актуальные чаты + квоту из БД
+        if (currentUser) scheduleServerSync('updateUIForUser');
+    } else {
+        updatePlanDisplay();
+        dismissChatInputFocus();
+    }
+}
+
+function logout() {
+    if (typeof getSolfSessionToken === 'function' && getSolfSessionToken()) {
+        fetch(`${WORKER_URL}/auth/logout`, {
+            method: 'POST',
+            headers: solfAuthHeaders(),
+        }).catch(() => {});
+    }
+    if (typeof clearSolfAuth === 'function') clearSolfAuth();
+    currentUser = null;
+    localStorage.setItem('solfai_plan_guest', JSON.stringify({ type: "free", emoji: PLAN_ICONS.free, name: "Free" }));
+    updateUIForUser();
+    updatePlanDisplay();
+    document.querySelectorAll('.profile-dropdown').forEach(d => d.classList.remove('active'));
+    // Полная перезагрузка страницы для чистого сброса состояния (чаты, кэш, UI)
+    setTimeout(() => { window.location.reload(); }, 60);
+}
+
+// === ОБРАБОТКА И ВЫВОД КАРТИНОК ===
+function handleFileSelect(files, container) {
+    const file = files[0];
+    
+    // Мягкая проверка: либо тип начинается на image/, либо расширение файла подходящее
+    if (!file || (!file.type.startsWith('image/') && !file.name.match(/\.(jpg|jpeg|png|gif|webp)$/i))) {
+        showToast(uiText('imageOnly', { fallback: 'Please select an image file' }), 'error');
+        return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = e => {
+        // Если тип пустой, ставим заглушку
+        attachedFiles = [{ name: file.name, type: file.type || 'image/jpeg', data: e.target.result }];
+        
+        if (container) {
+            container.innerHTML = `<div class="attached-file">
+                <img src="${e.target.result}" alt="">
+                <span>${file.name.slice(0, 15)}</span>
+                <button class="remove-file" onclick="attachedFiles=[]; this.parentElement.remove(); if (typeof refreshSendButtonState === 'function') refreshSendButtonState();">✕</button>
+            </div>`;
+        }
+        
+        refreshSendButtonState();
+    };
+    reader.readAsDataURL(file);
+}
+
+// ===== УДАЛЕНИЕ ЧАТА ПРИ 0 СООБЩЕНИЙ =====
+// ===== МЕТРОНОМ И ПИАНИНО =====
+let metronomeInterval = null; let metronomeAudioContext = null; let metronomeBpm = 120; let metronomeBeats = 4; let currentBeat = 0; let isMetronomePlaying = false;
+function initMetronome() {
+    const modal = document.getElementById('metronomeModal'); const openBtn = document.getElementById('openMetronomeBtn');
+    if(!modal) return;
+    openBtn?.addEventListener('click', () => { closeSidebarWhenOpeningTool(); modal.classList.add('active'); updateBeatIndicators(); });
+    document.getElementById('metronomeCloseBtn')?.addEventListener('click', () => { stopMetronome(); modal.classList.remove('active'); });
+    document.getElementById('bpmSlider')?.addEventListener('input', e => {
+        metronomeBpm = parseInt(e.target.value, 10);
+        document.getElementById('bpmValue').textContent = metronomeBpm;
+        updateTempoPresets();
+        updateMetronomeIntervalOnly();
+    });
+    document.getElementById('metronomePlayBtn')?.addEventListener('click', () => { isMetronomePlaying ? stopMetronome() : startMetronome(); });
+    
+    document.querySelectorAll('.tempo-preset').forEach(btn => {
+        btn.addEventListener('click', () => {
+            metronomeBpm = parseInt(btn.dataset.bpm);
+            document.getElementById('bpmSlider').value = metronomeBpm;
+            document.getElementById('bpmValue').textContent = metronomeBpm;
+            updateTempoPresets();
+            updateMetronomeIntervalOnly();
+        });
+    });
+    
+    document.querySelectorAll('.time-sig-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.time-sig-btn').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active'); metronomeBeats = parseInt(btn.dataset.beats);
+            updateBeatIndicators(); if (isMetronomePlaying) { stopMetronome(); startMetronome(); }
+        });
+    });
+}
+function updateTempoPresets() { document.querySelectorAll('.tempo-preset').forEach(btn => { btn.classList.toggle('active', Math.abs(parseInt(btn.dataset.bpm) - metronomeBpm) < 15); }); }
+
+/** Меняет только период тиков без немедленного удара (иначе при drag слайдера слышен «шум» из десятков кликов подряд). */
+function updateMetronomeIntervalOnly() {
+    if (!isMetronomePlaying) return;
+    clearInterval(metronomeInterval);
+    metronomeInterval = setInterval(playMetronomeTick, 60000 / metronomeBpm);
+}
+
+function updateBeatIndicators() {
+    const container = document.querySelector('.metronome-beat-indicators'); if (!container) return;
+    container.innerHTML = ''; for (let i = 0; i < metronomeBeats; i++) { const dot = document.createElement('span'); dot.className = 'beat-dot'; dot.dataset.beat = i + 1; container.appendChild(dot); }
+}
+function startMetronome() {
+    if (!metronomeAudioContext) metronomeAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+    if (metronomeAudioContext.state === 'suspended') metronomeAudioContext.resume();
+    isMetronomePlaying = true; currentBeat = 0;
+    document.getElementById('metronomePlayBtn').innerHTML = `<svg class="svg-icon" viewBox="0 0 24 24"><rect x="6" y="4" width="4" height="16"></rect><rect x="14" y="4" width="4" height="16"></rect></svg> <span>${uiText('metronomeStop', { fallback: 'Stop' })}</span>`;
+    playMetronomeTick(); metronomeInterval = setInterval(playMetronomeTick, 60000 / metronomeBpm);
+}
+function stopMetronome() {
+    isMetronomePlaying = false; clearInterval(metronomeInterval);
+    document.getElementById('metronomePlayBtn').innerHTML = `<svg class="svg-icon" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"></polygon></svg> <span>${uiText('metronomeStart', { fallback: 'Start' })}</span>`;
+}
+function playMetronomeTick() {
+    const isAccent = currentBeat === 0; const frequency = isAccent ? 1000 : 800; const duration = 0.05;
+    const oscillator = metronomeAudioContext.createOscillator(); const gainNode = metronomeAudioContext.createGain();
+    oscillator.connect(gainNode); gainNode.connect(metronomeAudioContext.destination);
+    oscillator.frequency.value = frequency; oscillator.type = 'square';
+    gainNode.gain.setValueAtTime(0.3, metronomeAudioContext.currentTime); gainNode.gain.exponentialRampToValueAtTime(0.01, metronomeAudioContext.currentTime + duration);
+    oscillator.start(metronomeAudioContext.currentTime); oscillator.stop(metronomeAudioContext.currentTime + duration);
+    
+    document.querySelectorAll('.beat-dot').forEach((dot, i) => {
+        dot.classList.remove('active', 'accent');
+        if (i === currentBeat) { dot.classList.add('active'); if (isAccent) dot.classList.add('accent'); }
+    });
+    
+    const pendulum = document.getElementById('metronomePendulum');
+    if (pendulum) { pendulum.classList.remove('tick'); void pendulum.offsetWidth; pendulum.classList.add('tick'); }
+    currentBeat = (currentBeat + 1) % metronomeBeats;
+}
+
+let pianoAudioContext = null;
+let pianoOctave = 4;
+const pianoNoteFreqs = { 'C': 261.63, 'C#': 277.18, 'D': 293.66, 'D#': 311.13, 'E': 329.63, 'F': 349.23, 'F#': 369.99, 'G': 392.00, 'G#': 415.30, 'A': 440.00, 'A#': 466.16, 'B': 493.88 };
+const pianoChords = { 'C': ['C', 'E', 'G'], 'D': ['D', 'F#', 'A'], 'E': ['E', 'G#', 'B'], 'F': ['F', 'A', 'C'], 'G': ['G', 'B', 'D'], 'A': ['A', 'C#', 'E'], 'B': ['B', 'D#', 'F#'], 'Cm': ['C', 'D#', 'G'], 'Dm': ['D', 'F', 'A'], 'Em': ['E', 'G', 'B'], 'Fm': ['F', 'G#', 'C'], 'Gm': ['G', 'A#', 'D'], 'Am': ['A', 'C', 'E'], 'Bm': ['B', 'D', 'F#'], 'C7': ['C', 'E', 'G', 'A#'], 'D7': ['D', 'F#', 'A', 'C'], 'E7': ['E', 'G#', 'B', 'D'], 'F7': ['F', 'A', 'C', 'D#'], 'G7': ['G', 'B', 'D', 'F'], 'A7': ['A', 'C#', 'E', 'G'], 'B7': ['B', 'D#', 'F#', 'A'] };
+let currentChordsPage = 0;
+const totalChordsPages = 3;
+
+function initPiano() {
+    const modal = document.getElementById('pianoModal'); const openBtn = document.getElementById('openPianoBtn');
+    if(!modal) return;
+    openBtn?.addEventListener('click', () => { closeSidebarWhenOpeningTool(); modal.classList.add('active'); });
+    document.getElementById('pianoCloseBtn')?.addEventListener('click', () => modal.classList.remove('active'));
+    modal?.addEventListener('click', e => { if (e.target === modal) modal.classList.remove('active'); });
+    
+    document.getElementById('octaveDown')?.addEventListener('click', () => { if (pianoOctave > 1) { pianoOctave--; document.getElementById('currentOctave').textContent = pianoOctave; } });
+    document.getElementById('octaveUp')?.addEventListener('click', () => { if (pianoOctave < 7) { pianoOctave++; document.getElementById('currentOctave').textContent = pianoOctave; } });
+    
+    document.querySelectorAll('.white-key, .black-key').forEach(key => {
+        const playNote = () => { const note = key.dataset.note; playPianoNote(note); key.classList.add('active'); document.getElementById('pianoNoteName').textContent = note + pianoOctave; document.getElementById('pianoNoteFreq').textContent = Math.round(getPianoFrequency(note)) + ' Hz'; };
+        const stopNote = () => key.classList.remove('active');
+        key.addEventListener('pointerdown', e => {
+            if (e.button !== 0) return;
+            e.preventDefault();
+            playNote();
+        });
+        key.addEventListener('pointerup', stopNote);
+        key.addEventListener('pointercancel', stopNote);
+        key.addEventListener('pointerleave', stopNote);
+    });
+    
+    document.querySelectorAll('.chord-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            const chordName = btn.dataset.chord; const notes = pianoChords[chordName];
+            if (notes) { playPianoChord(notes); btn.classList.add('active'); setTimeout(() => btn.classList.remove('active'), 500); document.getElementById('pianoNoteName').textContent = chordName; document.getElementById('pianoNoteFreq').textContent = notes.join(' - '); }
+        });
+    });
+    
+    document.getElementById('chordsLeft')?.addEventListener('click', () => { currentChordsPage = (currentChordsPage - 1 + totalChordsPages) % totalChordsPages; updateChordsPage(); });
+    document.getElementById('chordsRight')?.addEventListener('click', () => { currentChordsPage = (currentChordsPage + 1) % totalChordsPages; updateChordsPage(); });
+    
+    const keyMap = { 'a': 'C', 'w': 'C#', 's': 'D', 'e': 'D#', 'd': 'E', 'f': 'F', 't': 'F#', 'g': 'G', 'y': 'G#', 'h': 'A', 'u': 'A#', 'j': 'B' };
+    document.addEventListener('keydown', e => {
+        if (!modal.classList.contains('active') || e.repeat) return;
+        if (e.key === 'ArrowLeft' && pianoOctave > 1) { pianoOctave--; document.getElementById('currentOctave').textContent = pianoOctave; return; }
+        if (e.key === 'ArrowRight' && pianoOctave < 7) { pianoOctave++; document.getElementById('currentOctave').textContent = pianoOctave; return; }
+        const note = keyMap[e.key.toLowerCase()];
+        if (note) { playPianoNote(note); const keyEl = document.querySelector(`[data-note="${note}"]`); if (keyEl) keyEl.classList.add('active'); }
+    });
+    document.addEventListener('keyup', e => { const note = keyMap[e.key.toLowerCase()]; if (note) { const keyEl = document.querySelector(`[data-note="${note}"]`); if (keyEl) keyEl.classList.remove('active'); } });
+}
+function getPianoFrequency(note) { return pianoNoteFreqs[note] * Math.pow(2, pianoOctave - 4); }
+function playPianoNote(note) {
+    if (!pianoAudioContext) pianoAudioContext = new (window.AudioContext || window.webkitAudioContext)();
+    if (pianoAudioContext.state === 'suspended') pianoAudioContext.resume();
+    const osc = pianoAudioContext.createOscillator(); const gain = pianoAudioContext.createGain();
+    osc.connect(gain); gain.connect(pianoAudioContext.destination);
+    osc.type = 'triangle'; osc.frequency.value = getPianoFrequency(note);
+    const now = pianoAudioContext.currentTime;
+    gain.gain.setValueAtTime(0, now); gain.gain.linearRampToValueAtTime(0.5, now + 0.02); gain.gain.exponentialRampToValueAtTime(0.01, now + 1);
+    osc.start(now); osc.stop(now + 1);
+}
+function playPianoChord(notes) { 
+    notes.forEach((n, i) => {
+        setTimeout(() => {
+            playPianoNote(n);
+            const keyEl = document.querySelector(`[data-note="${n}"]`);
+            if (keyEl) {
+                keyEl.classList.add('active');
+                setTimeout(() => keyEl.classList.remove('active'), 500);
+            }
+        }, i * 20); 
+    }); 
+}
+function updateChordsPage() {
+    document.querySelectorAll('.chords-page').forEach((p, i) => p.classList.toggle('active', i === currentChordsPage));
+    document.querySelectorAll('.chord-dot').forEach((d, i) => d.classList.toggle('active', i === currentChordsPage));
+}
+
+// Одноразовая миграция: для залогиненных пользователей лимиты теперь живут только в БД,
+// поэтому старые ключи `solfai_usage_<userId>` и `solfai_img_<userId>` в localStorage
+// больше не нужны — они вводили в заблуждение ("блин, лимиты у меня в кэше???").
+// Чистим их один раз при первом запуске новой версии. Ключи гостя (`*_guest`) не трогаем.
+function migrateRemoveStaleUsageKeysOnce() {
+    try {
+        const FLAG = 'solfai_migrated_usage_v1';
+        if (localStorage.getItem(FLAG) === '1') return;
+        const toRemove = [];
+        for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (!k) continue;
+            if ((k.startsWith('solfai_usage_') || k.startsWith('solfai_img_')) && !k.endsWith('_guest')) {
+                toRemove.push(k);
+            }
+        }
+        toRemove.forEach((k) => { try { localStorage.removeItem(k); } catch (_) {} });
+        localStorage.setItem(FLAG, '1');
+    } catch (_) { /* localStorage может быть запрещён в incognito — не падаем */ }
+}
+
+// ===== ИНИЦИАЛИЗАЦИЯ И СЛУШАТЕЛИ =====
+function redirectVkOAuthToLogin() {
+    try {
+        const params = new URLSearchParams(window.location.search);
+        if (!params.get('code') || !params.get('device_id')) return;
+        if (/login\.html/i.test(window.location.pathname || '')) return;
+        window.location.replace('login.html' + window.location.search);
+    } catch (_) {}
+}
+
+async function initApp() {
+    redirectVkOAuthToLogin();
+    migrateRemoveStaleUsageKeysOnce();
+    // КРИТИЧНО: НЕ ждём sync. UI сразу с кэша; БД (квота + чаты) догоняет в фоне.
+    scheduleServerSync('initApp');
+    initTheme();
+    initColor();
+    initFontSize();
+
+    if (typeof setLanguage === 'function' && typeof currentLang !== 'undefined') {
+        setLanguage(currentLang); 
+    }
+    
+    // ВСЕГДА вызываем updateUIForUser, не только для гостей. Раньше тут было
+    // `if (!currentUser) updateUIForUser()` — и если юзер залогинен, аватарка/имя/email
+    // ставились ТОЛЬКО внутри syncAppData() после ответа БД. А если БД не отвечает
+    // (Cloudflare без VPN) — профиль так и оставался пустым ("есть buttn 'M' и всё").
+    // Теперь рисуем профиль СРАЗУ из localStorage-кэша, БД лишь освежит позже.
+    // skipChatReload: чаты уже поставит scheduleServerSync; локальный кэш — ниже одним разом.
+    chats = JSON.parse(localStorage.getItem(getChatsStorageKey()) || '[]');
+    updateUIForUser({ skipChatReload: true });
+    renderChatsList();
+    if (!currentChatId) startNewChat();
+    restorePendingQueryAfterLogin();
+    
+    // --- ПРАВИЛЬНАЯ РАБОТА ВИЗУАЛЬНЫХ КНОПОК ПРИКРЕПЛЕНИЯ ---
+    const attachBtns = document.querySelectorAll('#chatAttachBtn, .attach-btn');
+    attachBtns.forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            // Если лимит 0 - кидаем табличку. Если больше - открываем проводник
+            if (getRemainingImages() <= 0) {
+                showImageLimitModal();
+            } else {
+                if (chatFileInput) chatFileInput.click();
+            }
+        });
+    });
+
+    if (chatFileInput) {
+        chatFileInput.addEventListener('change', e => { 
+            handleFileSelect(e.target.files, chatAttachedFiles); 
+            // Задержка нужна, чтобы FileReader успел загрузить файл в память
+            setTimeout(() => { e.target.value = ''; }, 100);
+        });
+    }
+    if (chatMessages) {
+        chatMessages.addEventListener('scroll', () => {
+            const isAtBottom = chatMessages.scrollHeight - chatMessages.scrollTop - chatMessages.clientHeight < 20;
+            if (!autoScrollPausedByUser) {
+                shouldAutoScroll = isAtBottom;
+            }
+        });
+    }
+    
+    bindAppButtonFocusBehavior();
+
+    if (chatInput) {
+        chatInput.addEventListener('input', () => { autoGrowChatInput(); refreshSendButtonState(); });
+        chatInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!isGenerating) sendChatMessage(); } });
+        chatInput.addEventListener('paste', handleChatInputPaste);
+    }
+    
+    if (chatSendBtn) chatSendBtn.addEventListener('click', () => {
+        if (isGenerating) {
+            if (canAbortGeneration()) abortGeneration();
+            return;
+        }
+        sendChatMessage();
+    });
+    if (newChatBtn) newChatBtn.addEventListener('click', () => startNewChat({ focus: true }));
+    
+    if (toggleSidebarBtn) toggleSidebarBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        const willCollapse = !sidebar.classList.contains('collapsed');
+        sidebar.classList.toggle('collapsed');
+        syncMobileSidebarDrawerState();
+        if (willCollapse) {
+            resetSidebarExpandedMenus();
+            closeAllOverlays();
+        }
+    });
+
+    if (sidebar) {
+        const onMobileSidebarInteraction = e => {
+            if (!isMobileLayout()) return;
+            closeAllOverlays(e.target);
+            e.stopPropagation();
+        };
+        sidebar.addEventListener('click', onMobileSidebarInteraction, false);
+        sidebar.addEventListener('pointerdown', onMobileSidebarInteraction, { passive: true });
+    }
+
+    // Гарантированный сброс, если сайдбар закрылся любым способом
+    if (sidebar) {
+        const sidebarObserver = new MutationObserver(() => {
+            syncMobileSidebarDrawerState();
+            if (sidebar.classList.contains('collapsed')) {
+                resetSidebarExpandedMenus();
+                closeAllOverlays();
+            }
+        });
+        sidebarObserver.observe(sidebar, { attributes: true, attributeFilter: ['class'] });
+    }
+    window.addEventListener('resize', syncMobileSidebarDrawerState);
+    document.addEventListener('click', e => handleOutsideTapDismiss(e.target));
+    document.addEventListener(
+        'pointerdown',
+        e => {
+            if (!isMobileLayout()) return;
+            if (e.button != null && e.button !== 0) return;
+            handleOutsideTapDismiss(e.target);
+        },
+        true
+    );
+    
+    document.getElementById('limitCloseBtn')?.addEventListener('click', () => limitModal.classList.remove('active'));
+    document.getElementById('subscribeBtn')?.addEventListener('click', () => {
+        window.location.href = 'pricing.html';
+    });
+    document.getElementById('imageLimitCloseBtn')?.addEventListener('click', () => document.getElementById('imageLimitModal').classList.remove('active'));
+    document.getElementById('sidebarLoginBtn')?.addEventListener('click', navigateToLogin);
+    
+    document.getElementById('profileBtnChat')?.addEventListener('click', e => { 
+        e.stopPropagation(); 
+        const dropdown = document.getElementById('profileDropdownChat');
+        const isActive = dropdown.classList.contains('active');
+        closeAllOverlays();
+        if (!isActive) dropdown.classList.add('active'); 
+    });
+    
+    setInterval(() => { 
+        updateLimitTimer(); 
+        updateImageLimitTimer(); 
+        refreshImageAttachVisibility(); 
+    }, 60000);
+    refreshSendButtonState();
+}
+
+let appInitPromise = null;
+
+function revealApp() {
+    document.body.classList.remove('no-transition');
+    document.body.classList.remove('preload');
+    document.body.classList.add('app-ready');
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const sidebar = document.getElementById('sidebar');
+    const isMobile = isMobileLayout();
+
+    document.body.classList.add('preload');
+    document.body.classList.add('no-transition');
+
+    if (sidebar) {
+        if (isMobile) {
+            sidebar.classList.add('collapsed');
+        } else {
+            sidebar.classList.remove('collapsed');
+        }
+        syncMobileSidebarDrawerState();
+    }
+
+    // Safety: если fetch завис или сеть медленная — показываем UI через 3 секунды
+    const safetyTimer = setTimeout(revealApp, 3000);
+
+    appInitPromise = (async () => {
+        await initApp();
+        scheduleSkipChatInputFocusCleanup();
+        
+        if (typeof initMetronome === 'function') initMetronome();
+        if (typeof initPiano === 'function') initPiano();
+        if (typeof initQuiz === 'function') initQuiz();
+    })();
+    
+    if (window.visualViewport) {
+        let lastVisualViewportHeight = window.visualViewport.height;
+        const syncViewportCssVar = () => {
+            if (window.innerWidth >= 768) {
+                document.documentElement.style.setProperty('--vh', `${window.visualViewport.height * 0.01}px`);
+            } else {
+                document.documentElement.style.setProperty('--vh', `${window.innerHeight * 0.01}px`);
+            }
+        };
+        window.visualViewport.addEventListener('resize', () => {
+            syncViewportCssVar();
+            const vv = window.visualViewport;
+            const currentHeight = vv.height;
+            // Пользователь свернул клавиатуру вручную — фокус в textarea остаётся, iOS поднимет её снова при тапе.
+            if (
+                isMobileLayout() &&
+                chatInput &&
+                document.activeElement === chatInput &&
+                currentHeight > lastVisualViewportHeight + 40 &&
+                currentHeight >= window.innerHeight * 0.92
+            ) {
+                dismissMobileChatKeyboard();
+            }
+            lastVisualViewportHeight = currentHeight;
+            if (document.activeElement === chatInput) return;
+            setTimeout(() => scrollToBottom(true), 50);
+        });
+        syncViewportCssVar();
+    }
+    
+    const modals = document.querySelectorAll('.limit-modal, .quiz-modal, .tool-modal, .exit-modal-overlay');
+    const obs = new MutationObserver(() => { document.body.style.overflow = Array.from(modals).some(m => m.classList.contains('active')) ? 'hidden' : ''; });
+    modals.forEach(m => obs.observe(m, { attributes: true, attributeFilter: ['class'] }));
+
+    appInitPromise.finally(() => {
+        clearTimeout(safetyTimer);
+        requestAnimationFrame(revealApp);
+    });
+});
+
+window.addEventListener('load', () => {
+    if (appInitPromise && typeof appInitPromise.finally === 'function') {
+        appInitPromise.finally(() => {
+            requestAnimationFrame(revealApp);
+        });
+    } else {
+        requestAnimationFrame(revealApp);
+    }
+    scheduleSkipChatInputFocusCleanup();
+    if (isMobileLayout()) dismissChatInputFocus();
+});
+
+window.addEventListener('pageshow', () => {
+    scheduleSkipChatInputFocusCleanup();
+    if (isMobileLayout()) dismissChatInputFocus();
+    // bfcache / возврат на вкладку — подтянуть квоту и чаты с сервера
+    scheduleServerSync('pageshow');
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+        scheduleServerSync('visibility');
+    }
+});
+
+window.addEventListener('focus', () => {
+    scheduleServerSync('focus');
+});
+
+function abortGeneration() {
+    if (!canAbortGeneration()) return;
+    userAbortedGeneration = true;
+    currentAbortController?.abort();
+    if (lastUserQuery && chatInput) {
+        chatInput.value = lastUserQuery;
+        autoGrowChatInput();
+        if (shouldAutoFocusChatInput()) chatInput.focus();
+    }
+}
+
+// Service Worker — режим "kill-switch".
+//
+// У ряда пользователей в браузере залип старый SW от прошлого деплоя; он пытался кешировать
+// внешние CDN и без VPN падал с `Cache.put() encountered a network error`, а ещё отдавал 404
+// на favicon из мёртвого кеша. Поэтому:
+//   1. Если старый SW ещё не заменился — регистрируем sw.js, который сам снесёт все caches
+//      и сделает unregister (см. sw.js).
+//   2. Если SW уже умер (registrations пуст) — НИЧЕГО не регистрируем заново. Никаких новых SW.
+//
+// Откат: заменить sw.js на нормальный, развернуть его регистрацию обратно.
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', async () => {
+        try {
+            const regs = await navigator.serviceWorker.getRegistrations();
+            if (regs && regs.length > 0) {
+                // Есть старые регистрации — подменяем их kill-switch'ом.
+                navigator.serviceWorker.register('./sw.js').catch(() => {});
+            }
+        } catch (_) { /* SW недоступен — и не надо */ }
+    });
+}

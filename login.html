@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <script>
+        (function () {
+            try {
+                var theme = localStorage.getItem('solfai_theme');
+                if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
+                var color = localStorage.getItem('solfai_color');
+                if (color && color !== 'default') document.documentElement.setAttribute('data-color', color);
+            } catch (e) {}
+        })();
+    </script>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://accounts.google.com https://accounts.google.com/gsi/client https://id.vk.com https://id.vk.ru https://unpkg.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com https://accounts.google.com/gsi/; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https://*.googleusercontent.com https://lh3.googleusercontent.com https://*.userapi.com https://*.vk.com https://vk.com; connect-src 'self' https://functions.yandexcloud.net https://accounts.google.com https://id.vk.com https://id.vk.ru https://unpkg.com; frame-src https://accounts.google.com https://id.vk.com https://id.vk.ru; object-src 'none'; base-uri 'self'; form-action 'self';">
+    <title>Sign In — Solf.ai</title>
+    <link rel="icon" type="image/png" sizes="192x192" href="assets/favicon-192.png?v=8">
+    <link rel="icon" href="favicon.ico?v=8" sizes="48x48">
+    <link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32.png?v=8">
+    <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png?v=8">
+    <link rel="manifest" href="manifest.json">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="styles.css">
+    <style>
+        .login-page {
+            min-height: 100dvh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 24px 16px;
+            background: var(--bg-primary);
+            color: var(--text-primary);
+        }
+        .login-shell {
+            width: 100%;
+            max-width: 420px;
+            position: relative;
+        }
+        .login-back {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 40px;
+            height: 40px;
+            border-radius: 999px;
+            border: 1px solid var(--border-color);
+            background: var(--bg-card);
+            color: var(--text-primary);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            transition: border-color 0.2s ease, transform 0.2s ease;
+        }
+        .login-back:hover {
+            border-color: var(--purple-soft);
+            transform: translateX(-2px);
+        }
+        .login-back svg {
+            width: 18px;
+            height: 18px;
+            fill: none;
+            stroke: currentColor;
+            stroke-width: 2;
+            stroke-linecap: round;
+            stroke-linejoin: round;
+        }
+        .login-card {
+            margin-top: 56px;
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 24px;
+            padding: 40px 32px 32px;
+            text-align: center;
+            box-shadow: var(--shadow-soft);
+        }
+        .login-logo {
+            font-family: 'Outfit', system-ui, sans-serif;
+            font-size: 2.25rem;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+        .login-subtitle {
+            color: var(--text-secondary);
+            font-size: 1rem;
+            line-height: 1.5;
+            margin: 0 0 28px;
+        }
+        .terms-row {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            text-align: left;
+            padding: 8px 10px;
+            border-radius: 10px;
+            border: 1px solid var(--border-color);
+            background: transparent;
+            margin-bottom: 18px;
+            cursor: pointer;
+            transition: border-color 0.2s ease;
+        }
+        .terms-row:hover {
+            border-color: var(--purple-soft);
+        }
+        .terms-row input {
+            position: absolute;
+            opacity: 0;
+            width: 0;
+            height: 0;
+        }
+        .terms-switch {
+            flex-shrink: 0;
+            width: 36px;
+            height: 20px;
+            border-radius: 999px;
+            background: var(--border-color);
+            position: relative;
+            transition: background 0.2s ease;
+            margin-top: 0;
+        }
+        .terms-switch::after {
+            content: '';
+            position: absolute;
+            top: 2px;
+            left: 2px;
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            background: #fff;
+            box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+            transition: transform 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        .terms-row input:checked + .terms-switch {
+            background: var(--purple-soft);
+        }
+        .terms-row input:checked + .terms-switch::after {
+            transform: translateX(16px);
+        }
+        .terms-row input:focus-visible + .terms-switch {
+            outline: 2px solid var(--purple-glow);
+            outline-offset: 2px;
+        }
+        .terms-text {
+            font-size: 0.8rem;
+            line-height: 1.35;
+            color: var(--text-secondary);
+        }
+        .terms-text a {
+            color: var(--purple-glow);
+            text-decoration: none;
+            font-weight: 500;
+        }
+        .terms-text a:hover {
+            text-decoration: underline;
+        }
+        .login-auth {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            width: 100%;
+        }
+        .login-auth.auth-disabled {
+            opacity: 0.38;
+            pointer-events: none;
+            filter: grayscale(0.25);
+        }
+        .auth-circles {
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            gap: 48px;
+            width: 100%;
+            max-width: 240px;
+            margin: 0 auto;
+        }
+        .auth-slot {
+            position: relative;
+            width: 68px;
+            height: 68px;
+            flex-shrink: 0;
+        }
+        .auth-slot .auth-circle {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            z-index: 1;
+        }
+        .auth-hitbox {
+            position: absolute;
+            inset: 0;
+            z-index: 2;
+            border-radius: 50%;
+            overflow: hidden;
+            cursor: pointer;
+        }
+        .auth-hitbox > div {
+            width: 68px !important;
+            height: 68px !important;
+            min-height: 68px !important;
+            opacity: 0.001;
+        }
+        .auth-hitbox div[role="button"] {
+            width: 68px !important;
+            height: 68px !important;
+            min-width: 68px !important;
+            min-height: 68px !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border-radius: 50% !important;
+            cursor: pointer !important;
+        }
+        .auth-circle {
+            width: 68px;
+            height: 68px;
+            border-radius: 50%;
+            border: 1px solid var(--border-color);
+            background: var(--bg-card);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            cursor: pointer;
+            padding: 0;
+            flex-shrink: 0;
+            transition: transform 0.2s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        button.auth-circle:hover,
+        .auth-slot:hover .auth-circle {
+            transform: translateY(-2px);
+            border-color: var(--purple-soft);
+            box-shadow: var(--shadow-glow);
+        }
+        button.auth-circle:active {
+            transform: translateY(0) scale(0.96);
+        }
+        .auth-circle svg {
+            width: 32px;
+            height: 32px;
+            display: block;
+        }
+        .auth-circle--google {
+            background: #fff;
+        }
+        [data-theme="light"] .auth-circle--google {
+            border-color: rgba(0, 0, 0, 0.08);
+        }
+        .auth-circle--vk {
+            background: #0077ff;
+            border-color: rgba(0, 119, 255, 0.35);
+        }
+        .auth-circle--vk svg {
+            width: 34px;
+            height: 34px;
+        }
+        .login-later {
+            display: inline-block;
+            margin-top: 28px;
+            background: none;
+            border: none;
+            color: var(--text-secondary);
+            font-size: 0.92rem;
+            cursor: pointer;
+            text-decoration: none;
+            transition: color 0.2s ease;
+        }
+        .login-later:hover {
+            color: var(--text-primary);
+        }
+        @media (max-width: 480px) {
+            .login-card {
+                padding: 32px 20px 24px;
+            }
+            .auth-circles {
+                gap: 36px;
+                max-width: 220px;
+            }
+            .auth-slot,
+            .auth-circle {
+                width: 62px;
+                height: 62px;
+            }
+            .auth-hitbox > div,
+            .auth-hitbox div[role="button"] {
+                width: 62px !important;
+                height: 62px !important;
+                min-width: 62px !important;
+                min-height: 62px !important;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="login-page">
+        <div class="login-shell">
+            <button type="button" class="login-back" id="loginBackBtn" aria-label="Back">
+                <svg viewBox="0 0 24 24" aria-hidden="true"><polyline points="15 18 9 12 15 6"></polyline></svg>
+            </button>
+
+            <div class="login-card">
+                <div class="login-logo">Solf<span class="logo-dot">.ai</span></div>
+                <p class="login-subtitle">Sign in to save your chat history</p>
+
+                <label class="terms-row" for="termsAccept">
+                    <input type="checkbox" id="termsAccept">
+                    <span class="terms-switch" aria-hidden="true"></span>
+                    <span class="terms-text" id="termsText">
+                        Agree to
+                        <a href="terms.html" target="_blank" rel="noopener" onclick="event.stopPropagation()">Terms</a>,
+                        <a href="privacy.html" target="_blank" rel="noopener" onclick="event.stopPropagation()">Privacy</a>,
+                        <a href="privacy.html#consent" target="_blank" rel="noopener" onclick="event.stopPropagation()">data processing</a>
+                        &amp;
+                        <a href="privacy.html#cookies" target="_blank" rel="noopener" onclick="event.stopPropagation()">Cookies</a>
+                    </span>
+                </label>
+
+                <div class="login-auth auth-disabled" id="authProviders">
+                    <div class="auth-circles">
+                        <div class="auth-slot">
+                            <div class="auth-circle auth-circle--google" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z"/>
+                                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                                </svg>
+                            </div>
+                            <div class="auth-hitbox" id="googleBridge" title="Sign in with Google" aria-label="Sign in with Google"></div>
+                        </div>
+                        <button type="button" class="auth-circle auth-circle--vk" id="authVk" title="Continue with VK" aria-label="Continue with VK">
+                            <svg viewBox="0 0 28 28" aria-hidden="true" fill="#fff">
+                                <path fill-rule="evenodd" clip-rule="evenodd" d="M4.55 4.55C3 6.09 3 8.58 3 13.56v.88c0 4.98 0 7.47 1.55 8.9C6.09 25 8.58 25 13.56 25h.88c4.98 0 7.47 0 8.9-1.55C25 21.91 25 19.42 25 14.44v-.88c0-4.98 0-7.47-1.55-8.9C21.91 3 19.42 3 14.44 3h-.88c-4.98 0-7.47 0-8.9 1.55zM6.8 10.15c.12 5.72 3.13 9.16 8.09 9.16h.29v-3.26c1.81.18 3.16 1.52 3.71 3.26h2.61c-.71-2.61-2.54-4.05-3.68-4.6 1.14-.68 2.75-2.32 3.13-4.56h-2.37c-.5 1.82-1.98 3.47-3.39 3.63V10.15H12.77V16.5c-1.47-.37-3.38-2.15-3.46-6.35H6.8z"/>
+                            </svg>
+                        </button>
+                    </div>
+                </div>
+
+                <a href="index.html" class="login-later" id="loginLaterBtn">Maybe later</a>
+            </div>
+        </div>
+    </div>
+
+    <script src="auth.js?v=1"></script>
+    <script src="login.js?v=19"></script>
+</body>
+</html>
