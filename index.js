@@ -25,7 +25,9 @@ function jsonResponse(statusCode, data) {
       ...corsHeaders,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(data == null ? {} : data),
+    body: JSON.stringify(data == null ? {} : data, (_k, v) =>
+      typeof v === "bigint" ? Number(v) : v
+    ),
   };
 }
 
@@ -139,10 +141,18 @@ module.exports.handler = async function (event, context) {
     }
 
   async function neonQuery(queryText, params = []) {
-    if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is missing in environment variables");
+    if (!process.env.DATABASE_URL) {
+      throw new Error("DATABASE_URL is missing in environment variables");
+    }
 
-    const dbUrl = new URL(process.env.DATABASE_URL);
+    let dbUrl;
+    try {
+      dbUrl = new URL(process.env.DATABASE_URL);
+    } catch (_) {
+      throw new Error("DATABASE_URL is not a valid URL");
+    }
     const host = dbUrl.hostname;
+    if (!host) throw new Error("DATABASE_URL has empty hostname");
 
     const response = await fetch(`https://${host}/sql`, {
       method: "POST",
@@ -153,28 +163,77 @@ module.exports.handler = async function (event, context) {
       body: JSON.stringify({ query: queryText, params }),
     });
 
-    if (!response.ok) {
-      const errText = await response.text();
-      console.error("Neon DB Error:", errText);
-      throw new Error("Database query failed");
+    const rawText = await response.text();
+    let data = null;
+    try {
+      data = rawText ? JSON.parse(rawText) : null;
+    } catch (_) {
+      data = null;
     }
 
-    return response.json();
+    if (!response.ok) {
+      console.error("Neon DB Error:", rawText);
+      throw new Error(
+        `Database query failed (${response.status}): ${(rawText || "").slice(0, 400)}`
+      );
+    }
+
+    // Neon иногда отдаёт 200 с ошибкой в теле
+    if (data && (data.message || data.error || data.code === "XX000")) {
+      const msg = data.message || data.error?.message || JSON.stringify(data.error || data);
+      // Не считаем ошибкой обычный успешный payload с message-полем в rows
+      if (!Array.isArray(data.rows) && !Array.isArray(data.fields)) {
+        console.error("Neon DB logical error:", data);
+        throw new Error(`Neon: ${String(msg).slice(0, 400)}`);
+      }
+    }
+
+    if (!data || typeof data !== "object") {
+      throw new Error("Neon returned empty/invalid JSON");
+    }
+
+    // Нормализуем rows, если драйвер вернул массив массивов
+    if (Array.isArray(data.rows) && data.fields && data.rows.length && Array.isArray(data.rows[0])) {
+      data.rows = data.rows.map((arr) => {
+        const obj = {};
+        data.fields.forEach((f, i) => {
+          const name = f.columnID != null ? f.name : (f.name || f.columnName || `c${i}`);
+          obj[name] = arr[i];
+        });
+        return obj;
+      });
+    }
+
+    return data;
   }
 
   // ========== Neon-backed KV (замена Cloudflare KV для сессий / OTP) ==========
   let kvReady = false;
+  let kvInitError = null;
 
   async function ensureKvTable() {
     if (kvReady) return;
-    await neonQuery(`
-      CREATE TABLE IF NOT EXISTS kv_store (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL,
-        expires_at BIGINT
-      )
-    `);
-    kvReady = true;
+    if (kvInitError) throw kvInitError;
+    try {
+      await neonQuery(
+        `CREATE TABLE IF NOT EXISTS kv_store (
+          key TEXT PRIMARY KEY,
+          value TEXT NOT NULL,
+          expires_at TEXT
+        )`
+      );
+      // На старых деплоях expires_at мог стать timestamp/bigint — приводим к TEXT
+      try {
+        await neonQuery(
+          `ALTER TABLE kv_store
+           ALTER COLUMN expires_at TYPE TEXT USING expires_at::text`
+        );
+      } catch (_) {}
+      kvReady = true;
+    } catch (err) {
+      kvInitError = err;
+      throw err;
+    }
   }
 
   const kv = {
@@ -186,7 +245,8 @@ module.exports.handler = async function (event, context) {
       );
       const row = data.rows?.[0];
       if (!row) return null;
-      if (row.expires_at != null && Number(row.expires_at) > 0 && Number(row.expires_at) < Date.now()) {
+      const exp = Number(row.expires_at) || 0;
+      if (exp > 0 && exp < Date.now()) {
         await neonQuery(`DELETE FROM kv_store WHERE key = $1`, [key]).catch(() => {});
         return null;
       }
@@ -195,7 +255,8 @@ module.exports.handler = async function (event, context) {
     async put(key, value, opts = {}) {
       await ensureKvTable();
       const ttl = Number(opts.expirationTtl) || 0;
-      const expiresAt = ttl > 0 ? Date.now() + ttl * 1000 : null;
+      // Храним ms как TEXT — так Neon/Postgres не кастуют в date/time (ошибка 22008)
+      const expiresAt = ttl > 0 ? String(Date.now() + ttl * 1000) : "0";
       await neonQuery(
         `INSERT INTO kv_store (key, value, expires_at)
          VALUES ($1, $2, $3)
@@ -651,14 +712,25 @@ module.exports.handler = async function (event, context) {
   async function createSession(userId) {
     const store = sessionStore();
     if (!store) throw new Error("Session storage is required for auth");
-    const token = crypto.randomUUID();
+    const token = (crypto.randomUUID
+      ? crypto.randomUUID()
+      : crypto.randomBytes(16).toString("hex"));
     const createdAt = Date.now();
-    await store.put(
-      "sess:" + token,
-      JSON.stringify({ userId, createdAt }),
-      { expirationTtl: SESSION_TTL_SEC }
-    );
-    await registerUserSession(userId, token, createdAt);
+    try {
+      await store.put(
+        "sess:" + token,
+        JSON.stringify({ userId, createdAt }),
+        { expirationTtl: SESSION_TTL_SEC }
+      );
+    } catch (err) {
+      throw new Error("Session KV write failed: " + (err.message || String(err)));
+    }
+    try {
+      await registerUserSession(userId, token, createdAt);
+    } catch (err) {
+      console.warn("[session] registerUserSession failed:", err);
+      // Токен уже записан — логин всё равно возможен
+    }
     return token;
   }
 
@@ -721,8 +793,8 @@ module.exports.handler = async function (event, context) {
   }
 
   function forbidSelfOnly(sessionUserId, targetUserId) {
-    if (!targetUserId || sessionUserId !== targetUserId) {
-      return jsonResponse(403, { error: "Forbidden" });
+    if (!targetUserId || String(sessionUserId) !== String(targetUserId)) {
+      return jsonResponse(403, { error: "Forbidden", code: "FORBIDDEN" });
     }
     return null;
   }
@@ -794,12 +866,20 @@ module.exports.handler = async function (event, context) {
       let sessionToken;
       try {
         dbUser = await upsertOAuthUser(profile);
-        sessionToken = await createSession(profile.id);
       } catch (dbErr) {
-        console.error("[auth/google] DB/session error:", dbErr);
+        console.error("[auth/google] save user error:", dbErr);
+        return jsonResponse(500, {
+          error: "Failed to save user",
+          details: dbErr.message || String(dbErr),
+        });
+      }
+      try {
+        sessionToken = await createSession(profile.id);
+      } catch (sessErr) {
+        console.error("[auth/google] session error:", sessErr);
         return jsonResponse(500, {
           error: "Failed to create user session",
-          details: dbErr.message || String(dbErr),
+          details: sessErr.message || String(sessErr),
         });
       }
 
@@ -1127,6 +1207,39 @@ module.exports.handler = async function (event, context) {
     const body = (httpMethod === "POST" || httpMethod === "PUT" || httpMethod === "PATCH")
       ? parseBody(event)
       : null;
+
+    if (httpMethod === "GET" && pathname === "/health") {
+      const info = {
+        ok: true,
+        hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
+        hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
+        hasGoogleClientId: Boolean(process.env.GOOGLE_CLIENT_ID),
+        node: process.version,
+      };
+      if (!process.env.DATABASE_URL) {
+        return jsonResponse(500, { ...info, ok: false, error: "DATABASE_URL missing" });
+      }
+      try {
+        const ping = await neonQuery("SELECT 1 AS ok");
+        info.db = "ok";
+        info.dbRows = ping.rows || [];
+        try {
+          await ensureKvTable();
+          info.kv_store = "ok";
+        } catch (kvErr) {
+          info.kv_store = "fail";
+          info.kv_error = kvErr.message || String(kvErr);
+        }
+        return jsonResponse(info.kv_store === "ok" ? 200 : 500, info);
+      } catch (dbErr) {
+        return jsonResponse(500, {
+          ...info,
+          ok: false,
+          db: "fail",
+          error: dbErr.message || String(dbErr),
+        });
+      }
+    }
 
     // OTP / OAuth routes (с учётом возможного хвоста в path)
     const isAuthPath = (suffix) =>
