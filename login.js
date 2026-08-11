@@ -89,44 +89,27 @@ async function exchangeVkTokens(payload) {
     onAuthSuccess(data.user, data.sessionToken);
 }
 
-function updateAuthGate() {
-    const providers = document.getElementById('authProviders');
-    const ok = consentsOk();
-    if (providers) providers.classList.toggle('auth-disabled', !ok);
-}
-
-function ensureGoogleSignInLoaded() {
-    if (typeof google !== 'undefined' && google.accounts) {
-        initGoogleAuth();
-        return;
-    }
-    if (window.__solfGsiLoading) return;
-    window.__solfGsiLoading = true;
-    const s = document.createElement('script');
-    s.src = 'https://accounts.google.com/gsi/client';
-    s.async = true;
-    s.defer = true;
-    s.onload = () => { try { initGoogleAuth(); } catch (_) {} };
-    s.onerror = () => {
-        window.__solfGsiLoading = false;
-        console.warn('[Solf.ai] Google Sign-In unavailable.');
-    };
-    document.head.appendChild(s);
-}
-
-function mountGoogleBridge() {
+function mountGoogleBridge(force) {
     const container = document.getElementById('googleBridge');
-    if (!container || container.dataset.rendered === '1') return;
+    if (!container) return;
     if (typeof google === 'undefined' || !google.accounts?.id?.renderButton) return;
 
-    container.dataset.rendered = '1';
-    google.accounts.id.renderButton(container, {
-        type: 'icon',
-        shape: 'circle',
-        size: 'large',
-        theme: 'outline',
-        locale: 'en'
-    });
+    if (force || container.dataset.rendered !== '1') {
+        container.innerHTML = '';
+        container.dataset.rendered = '1';
+        google.accounts.id.renderButton(container, {
+            type: 'icon',
+            shape: 'circle',
+            size: 'large',
+            theme: 'outline',
+            locale: 'en',
+            click_listener: () => {
+                if (!consentsOk()) {
+                    alert(window.__solfTermsAlert || 'Please accept the terms and privacy first.');
+                }
+            },
+        });
+    }
 }
 
 function initGoogleAuth() {
@@ -143,6 +126,10 @@ function initGoogleAuth() {
                 alert(window.__solfTermsAlert || 'Please accept the terms and privacy first.');
                 return;
             }
+            if (!r?.credential) {
+                alert('Sign-in failed: empty Google credential');
+                return;
+            }
             persistConsents();
             exchangeGoogleCredential(r.credential).catch((err) => {
                 console.warn('[Solf.ai] Google auth error:', err);
@@ -150,7 +137,34 @@ function initGoogleAuth() {
             });
         }
     });
-    mountGoogleBridge();
+    mountGoogleBridge(true);
+}
+
+function updateAuthGate() {
+    const providers = document.getElementById('authProviders');
+    const ok = consentsOk();
+    if (providers) providers.classList.toggle('auth-disabled', !ok);
+    // После включения тогла пересобираем Google-кнопку (иначе iframe может не кликаться)
+    if (ok) mountGoogleBridge(true);
+}
+
+function ensureGoogleSignInLoaded() {
+    if (typeof google !== 'undefined' && google.accounts) {
+        initGoogleAuth();
+        return;
+    }
+    if (window.__solfGsiLoading) return;
+    window.__solfGsiLoading = true;
+    const s = document.createElement('script');
+    s.src = 'https://accounts.google.com/gsi/client';
+    s.async = true;
+    s.defer = true;
+    s.onload = () => { try { initGoogleAuth(); } catch (e) { console.warn('[Solf.ai] Google init error:', e); } };
+    s.onerror = () => {
+        window.__solfGsiLoading = false;
+        console.warn('[Solf.ai] Google Sign-In unavailable.');
+    };
+    document.head.appendChild(s);
 }
 
 function ensureVkIdLoaded() {

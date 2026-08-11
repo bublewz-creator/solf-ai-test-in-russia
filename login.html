@@ -162,9 +162,9 @@
         }
         .login-auth.auth-disabled {
             opacity: 0.38;
-            pointer-events: none;
             filter: grayscale(0.25);
         }
+        /* Не ставим pointer-events:none — Google iframe из‑за этого «мертвеет» */
         .auth-circles {
             display: flex;
             justify-content: center;
@@ -340,6 +340,6 @@
     </div>
 
     <script src="auth.js?v=2"></script>
-    <script src="login.js?v=21"></script>
+    <script src="login.js?v=22"></script>
 </body>
 </html>
