@@ -65,7 +65,7 @@ async function exchangeGoogleCredential(credential) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.sessionToken) {
-        const detail = data.error || data.errorMessage || `HTTP ${res.status}`;
+        const detail = [data.error, data.details].filter(Boolean).join(': ') || `HTTP ${res.status}`;
         throw new Error(detail);
     }
     onAuthSuccess(data.user, data.sessionToken);
@@ -83,7 +83,7 @@ async function exchangeVkTokens(payload) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.sessionToken) {
-        const detail = data.error || data.errorMessage || `HTTP ${res.status}`;
+        const detail = [data.error, data.details].filter(Boolean).join(': ') || `HTTP ${res.status}`;
         throw new Error(detail);
     }
     onAuthSuccess(data.user, data.sessionToken);
