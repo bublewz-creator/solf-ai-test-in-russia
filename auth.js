@@ -1,4 +1,4 @@
-// Shared session helpers for Solf.ai API (Cloudflare Worker Bearer tokens)
+// Shared session helpers for Solf.ai API (Yandex Cloud Functions)
 const SOLF_SESSION_KEY = 'solfai_session';
 
 function getSolfSessionToken() {
@@ -19,8 +19,26 @@ function setSolfSessionToken(token) {
 function solfAuthHeaders(extra = {}) {
     const headers = { ...extra };
     const token = getSolfSessionToken();
-    if (token) headers['Authorization'] = 'Bearer ' + token;
+    if (token) {
+        // Yandex Cloud Functions снимает Authorization — дублируем в X-Auth-Token
+        headers['Authorization'] = 'Bearer ' + token;
+        headers['X-Auth-Token'] = token;
+    }
     return headers;
+}
+
+/** URL для Yandex Function: путь только через ?path= (суффиксы /auth/... ломают functionID). */
+function workerApi(path, query = {}) {
+    const base = (typeof WORKER_URL !== 'undefined' && WORKER_URL)
+        ? WORKER_URL
+        : 'https://functions.yandexcloud.net/d4e2k40l9pmi9221vs4j';
+    const u = new URL(base);
+    const p = String(path || '/');
+    u.searchParams.set('path', p.startsWith('/') ? p : '/' + p);
+    Object.entries(query || {}).forEach(([k, v]) => {
+        if (v != null && v !== '') u.searchParams.set(k, String(v));
+    });
+    return u.toString();
 }
 
 function clearSolfAuth() {

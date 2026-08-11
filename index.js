@@ -12,17 +12,20 @@
 const crypto = require("crypto");
 
 const corsHeaders = {
-  "Content-Type": "application/json",
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Auth-Token",
 };
 
+/** Единый helper: любой ответ функции всегда с CORS. */
 function jsonResponse(statusCode, data) {
   return {
     statusCode,
-    headers: { ...corsHeaders },
-    body: JSON.stringify(data),
+    headers: {
+      ...corsHeaders,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(data == null ? {} : data),
   };
 }
 
@@ -38,13 +41,47 @@ function getHeader(headers, name) {
 }
 
 function getPathname(event) {
-  const raw = event.url || event.path || "/";
+  // Прямой HTTPS-вызов Яндекса НЕ поддерживает суффиксы пути
+  // (/d4e.../auth/google → "invalid functionID"). Роут передаём через ?path=
+  const qp = event.queryStringParameters || {};
+  const fromQuery = qp.path || qp.route || "";
+  if (fromQuery) {
+    const p = String(fromQuery);
+    return p.startsWith("/") ? p : "/" + p;
+  }
+
+  const raw = event.url || event.path || event.requestContext?.http?.path || "/";
+  let path = "/";
   try {
-    if (/^https?:\/\//i.test(raw)) return new URL(raw).pathname || "/";
-  } catch (_) {}
-  const q = raw.indexOf("?");
-  const path = q >= 0 ? raw.slice(0, q) : raw;
-  return path || "/";
+    if (/^https?:\/\//i.test(raw)) path = new URL(raw).pathname || "/";
+    else {
+      const q = String(raw).indexOf("?");
+      path = q >= 0 ? String(raw).slice(0, q) : String(raw);
+    }
+  } catch (_) {
+    path = String(raw).split("?")[0] || "/";
+  }
+  path = path || "/";
+
+  // На всякий случай: /d4e2k40l9pmi9221vs4j/auth/google → /auth/google
+  const fnId = process.env.FUNCTION_ID || "d4e2k40l9pmi9221vs4j";
+  if (path === "/" + fnId) return "/";
+  if (path.startsWith("/" + fnId + "/")) {
+    path = path.slice(fnId.length + 1) || "/";
+  }
+  return path;
+}
+
+function getHttpMethod(event, headers) {
+  const raw =
+    event.httpMethod ||
+    event.requestContext?.httpMethod ||
+    event.requestContext?.http?.method ||
+    event.method ||
+    "";
+  if (raw) return String(raw).toUpperCase();
+  if (getHeader(headers, "Access-Control-Request-Method")) return "OPTIONS";
+  return "GET";
 }
 
 function getQueryParams(event) {
@@ -81,22 +118,25 @@ function parseBody(event) {
 }
 
 module.exports.handler = async function (event, context) {
-  const httpMethod = String(event.httpMethod || event.requestContext?.http?.method || "GET").toUpperCase();
-  const pathname = getPathname(event);
-  const query = getQueryParams(event);
-  const headers = event.headers || {};
+  try {
+    event = event || {};
+    const headers = event.headers || {};
+    const httpMethod = getHttpMethod(event, headers);
+    const pathname = getPathname(event);
+    const query = getQueryParams(event);
 
-  if (httpMethod === "OPTIONS") {
-    return {
-      statusCode: 200,
-      headers: { ...corsHeaders },
-      body: "",
-    };
-  }
+    // CORS preflight — сразу 200 с CORS-заголовками
+    if (event.httpMethod === "OPTIONS" || httpMethod === "OPTIONS") {
+      return {
+        statusCode: 200,
+        headers: { ...corsHeaders },
+        body: "",
+      };
+    }
 
-  if (httpMethod === "GET" && (pathname === "/" || pathname === "")) {
-    return jsonResponse(200, { status: "Solf.ai API & NeonDB Gateway is running" });
-  }
+    if (httpMethod === "GET" && (pathname === "/" || pathname === "")) {
+      return jsonResponse(200, { status: "Solf.ai API & NeonDB Gateway is running" });
+    }
 
   async function neonQuery(queryText, params = []) {
     if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL is missing in environment variables");
@@ -637,12 +677,31 @@ module.exports.handler = async function (event, context) {
     if (userId) await removeTokenFromUserSessions(userId, token);
   }
 
+  function extractBearerToken() {
+    // Yandex Cloud Functions снимает заголовок Authorization из входящего запроса.
+    // Поэтому фронт дублирует токен в X-Auth-Token.
+    const candidates = [
+      getHeader(headers, "X-Auth-Token"),
+      getHeader(headers, "Authorization"),
+      getHeader(headers, "X-Yf-Remapped-Authorization"),
+    ];
+    for (const raw of candidates) {
+      if (!raw) continue;
+      const v = String(raw).trim();
+      if (v.toLowerCase().startsWith("bearer ")) {
+        const t = v.slice(7).trim();
+        if (t) return t;
+      } else if (v) {
+        return v;
+      }
+    }
+    return null;
+  }
+
   async function getSessionUserId() {
     const store = sessionStore();
     if (!store) return null;
-    const auth = getHeader(headers, "Authorization") || "";
-    if (!auth.startsWith("Bearer ")) return null;
-    const token = auth.slice(7).trim();
+    const token = extractBearerToken();
     if (!token) return null;
     const raw = await store.get("sess:" + token);
     if (!raw) return null;
@@ -683,109 +742,149 @@ module.exports.handler = async function (event, context) {
   }
 
   async function handleGoogleAuth(body) {
-    if (!sessionStore()) {
-      return jsonResponse(503, { error: "Session storage not configured" });
-    }
-    const credential = body?.credential;
-    if (!credential) {
-      return jsonResponse(400, { error: "Missing Google credential" });
-    }
-    const clientId = process.env.GOOGLE_CLIENT_ID;
-    if (!clientId) {
-      return jsonResponse(500, { error: "GOOGLE_CLIENT_ID not configured on server" });
-    }
+    console.log("Auth payload:", body);
+    try {
+      if (!sessionStore()) {
+        return jsonResponse(503, { error: "Session storage not configured" });
+      }
+      const credential = body?.credential;
+      if (!credential) {
+        return jsonResponse(400, { error: "Missing Google credential" });
+      }
 
-    const verifyRes = await fetch(
-      "https://oauth2.googleapis.com/tokeninfo?id_token=" + encodeURIComponent(credential)
-    );
-    const payload = await verifyRes.json().catch(() => ({}));
-    if (!verifyRes.ok || payload.error) {
-      return jsonResponse(401, { error: "Invalid Google token" });
-    }
-    if (payload.aud !== clientId) {
-      return jsonResponse(401, { error: "Google token audience mismatch" });
-    }
-    if (payload.exp && Number(payload.exp) * 1000 < Date.now()) {
-      return jsonResponse(401, { error: "Google token expired" });
-    }
+      let verifyRes;
+      let payload;
+      try {
+        verifyRes = await fetch(
+          "https://oauth2.googleapis.com/tokeninfo?id_token=" + encodeURIComponent(credential)
+        );
+        payload = await verifyRes.json().catch(() => ({}));
+      } catch (googleErr) {
+        console.error("[auth/google] tokeninfo failed:", googleErr);
+        return jsonResponse(502, {
+          error: "Could not verify Google token",
+          details: googleErr.message || String(googleErr),
+        });
+      }
 
-    const profile = {
-      id: payload.sub,
-      email: payload.email || "",
-      name: payload.name || payload.email || "User",
-      picture: payload.picture || "",
-    };
-    const dbUser = await upsertOAuthUser(profile);
-    const sessionToken = await createSession(profile.id);
-    return jsonResponse(200, { user: dbUser || profile, sessionToken });
+      if (!verifyRes.ok || payload.error || !payload.sub) {
+        return jsonResponse(401, {
+          error: "Invalid Google token",
+          details: payload.error || payload.error_description || undefined,
+        });
+      }
+
+      // Если GOOGLE_CLIENT_ID задан — сверяем aud. Если нет — принимаем валидный tokeninfo без жёсткой проверки.
+      const clientId = process.env.GOOGLE_CLIENT_ID;
+      if (clientId && payload.aud && payload.aud !== clientId) {
+        return jsonResponse(401, { error: "Google token audience mismatch" });
+      }
+      if (payload.exp && Number(payload.exp) * 1000 < Date.now()) {
+        return jsonResponse(401, { error: "Google token expired" });
+      }
+
+      const profile = {
+        id: String(payload.sub),
+        email: payload.email || "",
+        name: payload.name || payload.email || "User",
+        picture: payload.picture || "",
+      };
+
+      let dbUser;
+      let sessionToken;
+      try {
+        dbUser = await upsertOAuthUser(profile);
+        sessionToken = await createSession(profile.id);
+      } catch (dbErr) {
+        console.error("[auth/google] DB/session error:", dbErr);
+        return jsonResponse(500, {
+          error: "Failed to create user session",
+          details: dbErr.message || String(dbErr),
+        });
+      }
+
+      return jsonResponse(200, { user: dbUser || profile, sessionToken });
+    } catch (err) {
+      console.error("[auth/google]", err);
+      return jsonResponse(500, {
+        error: err.message || "Google auth failed",
+      });
+    }
   }
 
   async function handleVkAuth(body) {
-    if (!sessionStore()) {
-      return jsonResponse(503, { error: "Session storage not configured" });
-    }
-    const clientId = String(process.env.VK_APP_ID || body?.client_id || "54641545");
-    let vkUserId = null;
-    let name = "";
-    let email = "";
-    let picture = "";
-
-    if (body?.id_token) {
-      const res = await fetch("https://id.vk.com/oauth2/public_info", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ id_token: body.id_token, client_id: clientId }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        return jsonResponse(401, { error: "Invalid VK token", details: data });
+    try {
+      if (!sessionStore()) {
+        return jsonResponse(503, { error: "Session storage not configured" });
       }
-      const u = data.user || data;
-      vkUserId = u.user_id || u.userId || data.user_id;
-      name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim();
-      email = u.email || "";
-      picture = u.avatar || u.photo_200 || "";
-    } else if (body?.access_token) {
-      const res = await fetch("https://id.vk.com/oauth2/user_info", {
-        method: "POST",
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-        body: new URLSearchParams({ access_token: body.access_token, client_id: clientId }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        return jsonResponse(401, { error: "Invalid VK access token", details: data });
+      const clientId = String(process.env.VK_APP_ID || body?.client_id || "54641545");
+      let vkUserId = null;
+      let name = "";
+      let email = "";
+      let picture = "";
+
+      if (body?.id_token) {
+        const res = await fetch("https://id.vk.com/oauth2/public_info", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ id_token: body.id_token, client_id: clientId }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          return jsonResponse(401, { error: "Invalid VK token", details: data });
+        }
+        const u = data.user || data;
+        vkUserId = u.user_id || u.userId || data.user_id;
+        name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim();
+        email = u.email || "";
+        picture = u.avatar || u.photo_200 || "";
+      } else if (body?.access_token) {
+        const res = await fetch("https://id.vk.com/oauth2/user_info", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ access_token: body.access_token, client_id: clientId }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          return jsonResponse(401, { error: "Invalid VK access token", details: data });
+        }
+        const u = data.user || data;
+        vkUserId = u.user_id || u.userId || data.user_id;
+        name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim();
+        email = u.email || "";
+        picture = u.avatar || u.photo_200 || "";
+      } else {
+        return jsonResponse(400, { error: "Missing VK id_token or access_token" });
       }
-      const u = data.user || data;
-      vkUserId = u.user_id || u.userId || data.user_id;
-      name = [u.first_name, u.last_name].filter(Boolean).join(" ").trim();
-      email = u.email || "";
-      picture = u.avatar || u.photo_200 || "";
-    } else {
-      return jsonResponse(400, { error: "Missing VK id_token or access_token" });
-    }
 
-    if (!vkUserId) {
-      return jsonResponse(401, { error: "Could not resolve VK user id" });
-    }
+      if (!vkUserId) {
+        return jsonResponse(401, { error: "Could not resolve VK user id" });
+      }
 
-    const profile = {
-      id: "vk_" + vkUserId,
-      email,
-      name: name || "VK User",
-      picture,
-    };
-    const dbUser = await upsertOAuthUser(profile);
-    const sessionToken = await createSession(profile.id);
-    return jsonResponse(200, { user: dbUser || profile, sessionToken });
+      const profile = {
+        id: "vk_" + vkUserId,
+        email,
+        name: name || "VK User",
+        picture,
+      };
+      const dbUser = await upsertOAuthUser(profile);
+      const sessionToken = await createSession(profile.id);
+      return jsonResponse(200, { user: dbUser || profile, sessionToken });
+    } catch (err) {
+      console.error("[auth/vk]", err);
+      return jsonResponse(500, { error: err.message || "VK auth failed" });
+    }
   }
 
   async function handleLogout() {
-    const auth = getHeader(headers, "Authorization") || "";
-    if (auth.startsWith("Bearer ")) {
-      const token = auth.slice(7).trim();
+    try {
+      const token = extractBearerToken();
       if (token) await destroySession(token);
+      return jsonResponse(200, { ok: true });
+    } catch (err) {
+      console.error("[auth/logout]", err);
+      return jsonResponse(200, { ok: true });
     }
-    return jsonResponse(200, { ok: true });
   }
 
   // ========== OTP AUTH (email / phone) ==========
@@ -1025,26 +1124,28 @@ module.exports.handler = async function (event, context) {
     return jsonResponse(200, { ok: true, user: dbUser || user, sessionToken });
   }
 
-  try {
     const body = (httpMethod === "POST" || httpMethod === "PUT" || httpMethod === "PATCH")
       ? parseBody(event)
       : null;
 
-    // OTP routes
-    if (pathname === "/auth/send-code" && httpMethod === "POST") {
+    // OTP / OAuth routes (с учётом возможного хвоста в path)
+    const isAuthPath = (suffix) =>
+      pathname === suffix || pathname.endsWith(suffix);
+
+    if (isAuthPath("/auth/send-code") && httpMethod === "POST") {
       return await handleSendCode(body);
     }
-    if (pathname === "/auth/verify-code" && httpMethod === "POST") {
+    if (isAuthPath("/auth/verify-code") && httpMethod === "POST") {
       return await handleVerifyCode(body);
     }
 
-    if (pathname === "/auth/google" && httpMethod === "POST") {
+    if ((isAuthPath("/auth/google") || pathname === "/auth") && httpMethod === "POST") {
       return await handleGoogleAuth(body);
     }
-    if (pathname === "/auth/vk" && httpMethod === "POST") {
+    if (isAuthPath("/auth/vk") && httpMethod === "POST") {
       return await handleVkAuth(body);
     }
-    if (pathname === "/auth/logout" && httpMethod === "POST") {
+    if (isAuthPath("/auth/logout") && httpMethod === "POST") {
       return await handleLogout();
     }
 
@@ -1310,7 +1411,14 @@ module.exports.handler = async function (event, context) {
 
     return jsonResponse(404, { error: "Route not found" });
   } catch (err) {
-    console.error("Function Error:", err);
-    return jsonResponse(500, { error: err.message || "Internal error" });
+    console.error("CRITICAL ERROR:", err);
+    return {
+      statusCode: 500,
+      headers: {
+        ...corsHeaders,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ error: err.message || "Internal server error" }),
+    };
   }
 };

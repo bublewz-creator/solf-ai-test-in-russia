@@ -131,7 +131,7 @@ async function syncAppData() {
         // с локально-кэшированными данными (имя/план/счётчик), и UI будет работать.
         // prev_plan больше НЕ передаём: refill при sync ломал квоту между устройствами.
         const res = await apiFetch(
-            `${WORKER_URL}/get-user?id=${currentUser.id}`,
+            workerApi('/get-user', { id: currentUser.id }),
             {},
             12000
         );
@@ -205,7 +205,7 @@ function mergeChatRecords(local, server) {
 async function syncChatsFromServer() {
     if (!currentUser?.id) return;
     try {
-        const res = await apiFetch(`${WORKER_URL}/get-chats?user_id=${currentUser.id}`, {}, 15000);
+        const res = await apiFetch(workerApi('/get-chats', { user_id: currentUser.id }), {}, 15000);
         const data = await res.json().catch(() => ({}));
         if (!res.ok || data.error) {
             throw new Error(data.error || 'Failed to sync chats');
@@ -1718,7 +1718,7 @@ function enforceChatLimit() {
     if (currentUser && currentUser.id) {
         removed.forEach(chat => {
             if (!chat || !chat.id) return;
-            apiFetch(`${WORKER_URL}/delete-chat`, {
+            apiFetch(workerApi('/delete-chat'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id: chat.id, user_id: currentUser.id })
@@ -1771,7 +1771,7 @@ window.deleteChatFromSidebar = function(id, e) {
         
         // НОВОЕ: Отправляем запрос на удаление из БД
         if (currentUser) {
-            apiFetch(`${WORKER_URL}/delete-chat`, {
+            apiFetch(workerApi('/delete-chat'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id: id, user_id: currentUser.id })
@@ -2172,7 +2172,7 @@ async function consumeUsageOnServer(type = 'request') {
     if (!isUserLoggedIn()) return null;
     let res;
     try {
-        res = await apiFetch(`${WORKER_URL}/increment-usage`, {
+        res = await apiFetch(workerApi('/increment-usage'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ id: currentUser.id, type }),
@@ -2208,7 +2208,7 @@ async function consumeUsageOnServer(type = 'request') {
 async function refundUsageOnServer(type = 'request') {
     if (!isUserLoggedIn()) return;
     try {
-        const res = await apiFetch(`${WORKER_URL}/decrement-usage`, {
+        const res = await apiFetch(workerApi('/decrement-usage'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ id: currentUser.id, type }),
@@ -2295,7 +2295,7 @@ function showToast(message, type = 'success', options = {}) {
 // ===== ДВИЖОК ЧАТА =====
 function saveChatToServer(chat) {
     if (!currentUser?.id || !chat?.id) return;
-    apiFetch(`${WORKER_URL}/save-chat`, {
+    apiFetch(workerApi('/save-chat'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...chat, user_id: currentUser.id })
@@ -3716,7 +3716,7 @@ async function generateResponse(query, imageData = null) {
         };
 
         const requestTimeoutMs = imageData ? 90000 : 60000;
-        const res = await apiFetch(`${WORKER_URL}/generate`, { 
+        const res = await apiFetch(workerApi('/generate'), { 
             method: 'POST', 
             headers: { 'Content-Type': 'application/json' }, 
             body: JSON.stringify(payload), 
@@ -3780,7 +3780,7 @@ async function generateResponse(query, imageData = null) {
                         { role: 'user', content: notationRetryPrompts[ri] }
                     ]);
                     const retryBudget = notationRetryBudgets[ri] ?? 2048;
-                    const retryRes = await apiFetch(`${WORKER_URL}/generate`, {
+                    const retryRes = await apiFetch(workerApi('/generate'), {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -3828,7 +3828,7 @@ async function generateResponse(query, imageData = null) {
             } : null;
             try {
                 for (let hi = 0; hi < 2 && countNotationChords(aiText) < 4; hi++) {
-                    const harmRetryRes = await apiFetch(`${WORKER_URL}/generate`, {
+                    const harmRetryRes = await apiFetch(workerApi('/generate'), {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -3865,7 +3865,7 @@ async function generateResponse(query, imageData = null) {
             const expectedLen = expectedChainLength(baseUserContent);
             try {
                 for (let ci = 0; ci < 2 && countNotationChords(aiText) < expectedLen; ci++) {
-                    const chainRetryRes = await apiFetch(`${WORKER_URL}/generate`, {
+                    const chainRetryRes = await apiFetch(workerApi('/generate'), {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
@@ -4163,7 +4163,7 @@ function updateUIForUser(options = {}) {
 
 function logout() {
     if (typeof getSolfSessionToken === 'function' && getSolfSessionToken()) {
-        fetch(`${WORKER_URL}/auth/logout`, {
+        fetch(workerApi('/auth/logout'), {
             method: 'POST',
             headers: solfAuthHeaders(),
         }).catch(() => {});

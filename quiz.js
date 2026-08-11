@@ -101,8 +101,10 @@ function useQuiz() {
         if (cur >= limit) return false;
         currentUser.quiz_count = cur + 1;
         updateQuizCounter();
-        const workerUrl = typeof WORKER_URL !== 'undefined' ? WORKER_URL : 'https://functions.yandexcloud.net/d4e2k40l9pmi9221vs4j';
-        fetch(`${workerUrl}/increment-usage`, {
+        const url = typeof workerApi === 'function'
+            ? workerApi('/increment-usage')
+            : 'https://functions.yandexcloud.net/d4e2k40l9pmi9221vs4j?path=/increment-usage';
+        fetch(url, {
             method: 'POST',
             headers: solfAuthHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({ id: currentUser.id, type: 'quiz' }),

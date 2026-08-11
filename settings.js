@@ -239,7 +239,11 @@ function initSettingsPage() {
     });
     document.getElementById('settingsLogoutBtn').addEventListener('click', () => {
         if (typeof getSolfSessionToken === 'function' && getSolfSessionToken()) {
-            fetch('https://functions.yandexcloud.net/d4e2k40l9pmi9221vs4j/auth/logout', {
+            fetch(
+                typeof workerApi === 'function'
+                    ? workerApi('/auth/logout')
+                    : 'https://functions.yandexcloud.net/d4e2k40l9pmi9221vs4j?path=/auth/logout',
+                {
                 method: 'POST',
                 headers: typeof solfAuthHeaders === 'function' ? solfAuthHeaders() : {},
             }).catch(() => {});

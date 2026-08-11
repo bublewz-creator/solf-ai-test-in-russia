@@ -58,21 +58,21 @@ function onAuthSuccess(user, sessionToken) {
 }
 
 async function exchangeGoogleCredential(credential) {
-    const res = await fetchWithTimeout(`${WORKER_URL}/auth/google`, {
+    const res = await fetchWithTimeout(workerApi('/auth/google'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ credential }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.sessionToken) {
-        const detail = data.error || `HTTP ${res.status}`;
+        const detail = data.error || data.errorMessage || `HTTP ${res.status}`;
         throw new Error(detail);
     }
     onAuthSuccess(data.user, data.sessionToken);
 }
 
 async function exchangeVkTokens(payload) {
-    const res = await fetchWithTimeout(`${WORKER_URL}/auth/vk`, {
+    const res = await fetchWithTimeout(workerApi('/auth/vk'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -83,7 +83,7 @@ async function exchangeVkTokens(payload) {
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok || !data.sessionToken) {
-        const detail = data.error || `HTTP ${res.status}`;
+        const detail = data.error || data.errorMessage || `HTTP ${res.status}`;
         throw new Error(detail);
     }
     onAuthSuccess(data.user, data.sessionToken);

@@ -942,7 +942,10 @@
                 Object.assign(headers, solfAuthHeaders());
             }
 
-            const savePlan = fetch(`${WORKER_URL}/update-plan`, {
+            const planUrl = typeof workerApi === 'function'
+                ? workerApi('/update-plan')
+                : `${WORKER_URL}?path=/update-plan`;
+            const savePlan = fetch(planUrl, {
                 method: 'POST',
                 headers,
                 body: JSON.stringify({ id: currentUser.id, plan_type: planType }),
