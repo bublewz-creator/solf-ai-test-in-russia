@@ -20,8 +20,10 @@ function solfAuthHeaders(extra = {}) {
     const headers = { ...extra };
     const token = getSolfSessionToken();
     if (token) {
-        // Yandex Cloud Functions снимает Authorization — дублируем в X-Auth-Token
-        headers['Authorization'] = 'Bearer ' + token;
+        // Важно: НЕ слать Authorization на functions.yandexcloud.net —
+        // Яндекс принимает его как IAM-токен и отвечает
+        // {"errorMessage":"Forbidden: Not authorized"} ещё до нашей функции.
+        // Сессия только через X-Auth-Token.
         headers['X-Auth-Token'] = token;
     }
     return headers;

@@ -3755,11 +3755,11 @@ async function generateResponse(query, imageData = null) {
             }
             const detailedError =
                 data.message ||
+                data.errorMessage ||
                 data.error?.message ||
                 (typeof data.error === 'string' ? data.error : null) ||
                 data.deepseek_error?.message ||
                 data.gemini_error?.message ||
-                data.errorMessage ||
                 'API Error';
             throw new Error(detailedError);
         }

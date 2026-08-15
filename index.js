@@ -750,8 +750,9 @@ module.exports.handler = async function (event, context) {
   }
 
   function extractBearerToken() {
-    // Yandex Cloud Functions снимает заголовок Authorization из входящего запроса.
-    // Поэтому фронт дублирует токен в X-Auth-Token.
+    // Yandex Cloud Functions: заголовок Authorization с не-IAM токеном
+    // даёт платформенный 403 "Forbidden: Not authorized" до handler'а.
+    // Фронт шлёт сессию только в X-Auth-Token.
     const candidates = [
       getHeader(headers, "X-Auth-Token"),
       getHeader(headers, "Authorization"),
@@ -1211,7 +1212,7 @@ module.exports.handler = async function (event, context) {
     if (httpMethod === "GET" && pathname === "/health") {
       const info = {
         ok: true,
-        build: "2026-08-15-ds2",
+        build: "2026-08-15-ds3",
         generateProvider: "deepseek",
         deepseekModel: process.env.DEEPSEEK_MODEL || "deepseek-v4-flash",
         hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
@@ -1262,8 +1263,9 @@ module.exports.handler = async function (event, context) {
           body: JSON.stringify({
             model,
             messages: [{ role: "user", content: "Reply with one word: ok" }],
-            max_tokens: 8,
+            max_tokens: 16,
             temperature: 0,
+            thinking: { type: "disabled" },
           }),
         });
         const data = await res.json().catch(() => ({}));
@@ -1421,7 +1423,7 @@ module.exports.handler = async function (event, context) {
         return jsonResponse(500, {
           error: "DEEPSEEK_API_KEY not configured",
           provider: "deepseek",
-          build: "2026-08-15-ds2",
+          build: "2026-08-15-ds3",
         });
       }
 
@@ -1518,6 +1520,7 @@ module.exports.handler = async function (event, context) {
             messages: openaiMessages,
             temperature: body?.temperature ?? 0.7,
             max_tokens: maxTokens,
+            thinking: { type: "disabled" },
           }),
         });
         data = await response.json().catch(() => ({}));
@@ -1531,7 +1534,7 @@ module.exports.handler = async function (event, context) {
           error: "[DeepSeek] Cannot reach API: " + (netErr.message || String(netErr)),
           message: "[DeepSeek] Cannot reach API: " + (netErr.message || String(netErr)),
           provider: "deepseek",
-          build: "2026-08-15-ds2",
+          build: "2026-08-15-ds3",
           usage: usagePayload || undefined,
         });
       }
@@ -1553,7 +1556,7 @@ module.exports.handler = async function (event, context) {
           message: errMsg,
           provider: "deepseek",
           model: deepseekModel,
-          build: "2026-08-15-ds2",
+          build: "2026-08-15-ds3",
           deepseek_error: data.error || data,
           usage: usagePayload || undefined,
         });
@@ -1565,7 +1568,7 @@ module.exports.handler = async function (event, context) {
         text,
         provider: "deepseek",
         model: deepseekModel,
-        build: "2026-08-15-ds2",
+        build: "2026-08-15-ds3",
         usage: usagePayload || undefined,
       });
     }
