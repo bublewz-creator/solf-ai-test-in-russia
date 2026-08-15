@@ -5,7 +5,7 @@
 //   - module.exports.handler(event, context)
 //   - process.env вместо env bindings
 //   - ответы { statusCode, headers, body }
-//   - /generate → DeepSeek API (deepseek-chat)
+//   - /generate → DeepSeek API (deepseek-v4-flash)
 //   - сессии/OTP: NeonDB kv_store вместо Cloudflare KV
 // ============================================================================
 
@@ -793,7 +793,7 @@ module.exports.handler = async function (event, context) {
   }
 
   function forbidSelfOnly(sessionUserId, targetUserId) {
-    if (!targetUserId || sessionUserId !== targetUserId) {
+    if (!targetUserId || String(sessionUserId) !== String(targetUserId)) {
       return jsonResponse(403, { error: "Forbidden", code: "FORBIDDEN" });
     }
     return null;
@@ -1211,6 +1211,9 @@ module.exports.handler = async function (event, context) {
     if (httpMethod === "GET" && pathname === "/health") {
       const info = {
         ok: true,
+        build: "2026-08-15-ds2",
+        generateProvider: "deepseek",
+        deepseekModel: process.env.DEEPSEEK_MODEL || "deepseek-v4-flash",
         hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
         hasDeepseekKey: Boolean(process.env.DEEPSEEK_API_KEY),
         hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
@@ -1249,14 +1252,15 @@ module.exports.handler = async function (event, context) {
         return jsonResponse(500, { ok: false, error: "DEEPSEEK_API_KEY missing" });
       }
       try {
-        const res = await fetch("https://api.deepseek.com/chat/completions", {
+        const model = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
+        const res = await fetch("https://api.deepseek.com/v1/chat/completions", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: "Bearer " + key,
           },
           body: JSON.stringify({
-            model: "deepseek-chat",
+            model,
             messages: [{ role: "user", content: "Reply with one word: ok" }],
             max_tokens: 8,
             temperature: 0,
@@ -1267,12 +1271,19 @@ module.exports.handler = async function (event, context) {
           return jsonResponse(res.status || 500, {
             ok: false,
             status: res.status,
+            provider: "deepseek",
+            model,
             error: data.error?.message || data.message || "DeepSeek request failed",
             deepseek_error: data.error || data,
           });
         }
         const text = data?.choices?.[0]?.message?.content || "";
-        return jsonResponse(200, { ok: true, text: String(text).slice(0, 80) });
+        return jsonResponse(200, {
+          ok: true,
+          provider: "deepseek",
+          model,
+          text: String(text).slice(0, 80),
+        });
       } catch (err) {
         return jsonResponse(502, {
           ok: false,
@@ -1405,8 +1416,13 @@ module.exports.handler = async function (event, context) {
 
     if (pathname === "/generate" && httpMethod === "POST") {
       const deepseekKey = String(process.env.DEEPSEEK_API_KEY || "").trim();
+      const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
       if (!deepseekKey) {
-        return jsonResponse(500, { error: "DEEPSEEK_API_KEY not configured" });
+        return jsonResponse(500, {
+          error: "DEEPSEEK_API_KEY not configured",
+          provider: "deepseek",
+          build: "2026-08-15-ds2",
+        });
       }
 
       const auth = await requireAuth();
@@ -1417,17 +1433,20 @@ module.exports.handler = async function (event, context) {
       const image = (rawImage && typeof rawImage === "object" && rawImage.data && String(rawImage.data).length > 32)
         ? rawImage
         : null;
-      const userId = body?.userId || body?.user_id || auth.userId;
-
-      const forbid = forbidSelfOnly(auth.userId, userId);
-      if (forbid) return forbid;
+      // Всегда сессия — body.userId мог отличаться по типу (number vs string) и давать ложный 403.
+      const userId = auth.userId;
+      const bodyUserId = body?.userId || body?.user_id;
+      if (bodyUserId != null && String(bodyUserId) !== String(userId)) {
+        console.warn("[generate] body userId mismatch, using session:", bodyUserId, "vs", userId);
+      }
 
       const user = await getUserWithFreshUsage(userId);
       if (!user) {
-        return jsonResponse(404, { error: "User not found" });
+        return jsonResponse(404, { error: "User not found", provider: "deepseek" });
       }
 
       const skipUsageCharge = Boolean(body?.usageAlreadyCounted);
+      // DeepSeek text model — картинки не отправляем в API (иначе ломает запрос).
       const chargeType = image ? "image" : "request";
       let usagePayload = usageSnapshot(user);
 
@@ -1438,6 +1457,7 @@ module.exports.handler = async function (event, context) {
           return jsonResponse(usageResult.status || 400, {
             error: usageResult.error,
             code: usageResult.code,
+            provider: "deepseek",
             usage: usageSnapshot(usageResult.user),
             ...(usageSnapshot(usageResult.user) || {}),
           });
@@ -1449,11 +1469,11 @@ module.exports.handler = async function (event, context) {
       const requestedTokens = Number(body?.maxOutputTokens ?? body?.max_tokens ?? 2048);
       const maxTokens = Math.max(256, Math.min(Number.isFinite(requestedTokens) ? requestedTokens : 2048, 8192));
 
-      // OpenAI-совместимый формат для DeepSeek
+      // OpenAI-совместимый формат для DeepSeek (только текст)
       const openaiMessages = [];
       for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
-        const textContent = typeof msg.content === "string"
+        let textContent = typeof msg.content === "string"
           ? msg.content
           : (msg.content?.[0]?.text || "");
 
@@ -1464,25 +1484,12 @@ module.exports.handler = async function (event, context) {
 
         const role = msg.role === "assistant" ? "assistant" : "user";
         const isLastMessage = i === messages.length - 1;
-        const isUserMessage = role === "user";
-
-        if (image && isLastMessage && isUserMessage) {
-          const mime = image.mime_type || image.mimeType || "image/jpeg";
-          // deepseek-chat — текстовая модель; картинку передаём как data-URL на случай поддержки,
-          // иначе API вернёт ошибку — её покажем пользователю.
-          openaiMessages.push({
-            role: "user",
-            content: [
-              { type: "text", text: textContent || "Analyze image" },
-              {
-                type: "image_url",
-                image_url: { url: `data:${mime};base64,${image.data}` },
-              },
-            ],
-          });
-        } else {
-          openaiMessages.push({ role, content: textContent });
+        if (image && isLastMessage && role === "user") {
+          textContent = (textContent || "Analyze image") +
+            "\n\n[User attached an image. Vision is not available on this model — answer from the text only.]";
         }
+        if (!textContent && role === "assistant") textContent = " ";
+        openaiMessages.push({ role, content: textContent || " " });
       }
 
       if (!openaiMessages.length) {
@@ -1492,6 +1499,7 @@ module.exports.handler = async function (event, context) {
         }
         return jsonResponse(400, {
           error: "No messages to send to DeepSeek",
+          provider: "deepseek",
           usage: usagePayload || undefined,
         });
       }
@@ -1499,14 +1507,14 @@ module.exports.handler = async function (event, context) {
       let response;
       let data = {};
       try {
-        response = await fetch("https://api.deepseek.com/chat/completions", {
+        response = await fetch("https://api.deepseek.com/v1/chat/completions", {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
             Authorization: "Bearer " + deepseekKey,
           },
           body: JSON.stringify({
-            model: "deepseek-chat",
+            model: deepseekModel,
             messages: openaiMessages,
             temperature: body?.temperature ?? 0.7,
             max_tokens: maxTokens,
@@ -1520,7 +1528,10 @@ module.exports.handler = async function (event, context) {
           if (refunded) usagePayload = usageSnapshot(refunded);
         }
         return jsonResponse(502, {
-          error: "Cannot reach DeepSeek: " + (netErr.message || String(netErr)),
+          error: "[DeepSeek] Cannot reach API: " + (netErr.message || String(netErr)),
+          message: "[DeepSeek] Cannot reach API: " + (netErr.message || String(netErr)),
+          provider: "deepseek",
+          build: "2026-08-15-ds2",
           usage: usagePayload || undefined,
         });
       }
@@ -1530,15 +1541,19 @@ module.exports.handler = async function (event, context) {
           const refunded = await decrementUsageForUser(userId, chargeType);
           if (refunded) usagePayload = usageSnapshot(refunded);
         }
-        const errMsg =
+        const rawMsg =
           data.error?.message ||
           data.message ||
           (typeof data.error === "string" ? data.error : null) ||
-          `DeepSeek HTTP ${response.status}`;
+          `HTTP ${response.status}`;
+        const errMsg = "[DeepSeek] " + rawMsg;
         console.error("[generate] DeepSeek API error:", response.status, data.error || data);
         return jsonResponse(response.status || 500, {
           error: errMsg,
           message: errMsg,
+          provider: "deepseek",
+          model: deepseekModel,
+          build: "2026-08-15-ds2",
           deepseek_error: data.error || data,
           usage: usagePayload || undefined,
         });
@@ -1548,6 +1563,9 @@ module.exports.handler = async function (event, context) {
 
       return jsonResponse(200, {
         text,
+        provider: "deepseek",
+        model: deepseekModel,
+        build: "2026-08-15-ds2",
         usage: usagePayload || undefined,
       });
     }

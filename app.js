@@ -3757,6 +3757,7 @@ async function generateResponse(query, imageData = null) {
                 data.message ||
                 data.error?.message ||
                 (typeof data.error === 'string' ? data.error : null) ||
+                data.deepseek_error?.message ||
                 data.gemini_error?.message ||
                 data.errorMessage ||
                 'API Error';
