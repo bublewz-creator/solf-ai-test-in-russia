@@ -3753,7 +3753,13 @@ async function generateResponse(query, imageData = null) {
                 showImageLimitModal();
                 return;
             }
-            const detailedError = data.message || data.error?.message || data.error || 'API Error';
+            const detailedError =
+                data.message ||
+                data.error?.message ||
+                (typeof data.error === 'string' ? data.error : null) ||
+                data.gemini_error?.message ||
+                data.errorMessage ||
+                'API Error';
             throw new Error(detailedError);
         }
 

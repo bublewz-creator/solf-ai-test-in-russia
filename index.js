@@ -1241,6 +1241,43 @@ module.exports.handler = async function (event, context) {
       }
     }
 
+    // Быстрая проверка Gemini без авторизации (только факт доступа к API)
+    if (httpMethod === "GET" && pathname === "/health/gemini") {
+      const key = String(process.env.GEMINI_API_KEY || "").trim();
+      if (!key) {
+        return jsonResponse(500, { ok: false, error: "GEMINI_API_KEY missing" });
+      }
+      try {
+        const res = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              contents: [{ role: "user", parts: [{ text: "Reply with one word: ok" }] }],
+              generationConfig: { maxOutputTokens: 8, temperature: 0 },
+            }),
+          }
+        );
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) {
+          return jsonResponse(res.status || 500, {
+            ok: false,
+            status: res.status,
+            error: data.error?.message || data.message || "Gemini request failed",
+            gemini_error: data.error || data,
+          });
+        }
+        const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
+        return jsonResponse(200, { ok: true, text: text.slice(0, 80) });
+      } catch (err) {
+        return jsonResponse(502, {
+          ok: false,
+          error: "Cannot reach Gemini: " + (err.message || String(err)),
+        });
+      }
+    }
+
     // OTP / OAuth routes (с учётом возможного хвоста в path)
     const isAuthPath = (suffix) =>
       pathname === suffix || pathname.endsWith(suffix);
@@ -1364,7 +1401,8 @@ module.exports.handler = async function (event, context) {
     }
 
     if (pathname === "/generate" && httpMethod === "POST") {
-      if (!process.env.GEMINI_API_KEY) {
+      const geminiKey = String(process.env.GEMINI_API_KEY || "").trim();
+      if (!geminiKey) {
         return jsonResponse(500, { error: "GEMINI_API_KEY not configured" });
       }
 
@@ -1426,6 +1464,17 @@ module.exports.handler = async function (event, context) {
         contents.push({ role, parts });
       }
 
+      if (!contents.length) {
+        if (!skipUsageCharge) {
+          const refunded = await decrementUsageForUser(userId, chargeType);
+          if (refunded) usagePayload = usageSnapshot(refunded);
+        }
+        return jsonResponse(400, {
+          error: "No user/assistant messages to send to Gemini",
+          usage: usagePayload || undefined,
+        });
+      }
+
       // Картинка — в последнее сообщение пользователя
       if (image) {
         for (let i = contents.length - 1; i >= 0; i--) {
@@ -1449,30 +1498,63 @@ module.exports.handler = async function (event, context) {
         requestBody.systemInstruction = { parts: [{ text: systemPrompt.trim() }] };
       }
 
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${process.env.GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(requestBody),
+      let response;
+      let data = {};
+      try {
+        response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(requestBody),
+          }
+        );
+        data = await response.json().catch(() => ({}));
+      } catch (geminiNetErr) {
+        console.error("[generate] Gemini network error:", geminiNetErr);
+        if (!skipUsageCharge) {
+          const refunded = await decrementUsageForUser(userId, chargeType);
+          if (refunded) usagePayload = usageSnapshot(refunded);
         }
-      );
+        return jsonResponse(502, {
+          error: "Cannot reach Google Gemini from Yandex Cloud: " + (geminiNetErr.message || String(geminiNetErr)),
+          usage: usagePayload || undefined,
+        });
+      }
 
-      const data = await response.json().catch(() => ({}));
       if (!response.ok || data.error) {
         // Gemini упал после списания — возвращаем квоту
         if (!skipUsageCharge) {
           const refunded = await decrementUsageForUser(userId, chargeType);
           if (refunded) usagePayload = usageSnapshot(refunded);
         }
+        const geminiMsg =
+          data.error?.message ||
+          data.message ||
+          (typeof data.error === "string" ? data.error : null) ||
+          `Gemini HTTP ${response.status}`;
+        console.error("[generate] Gemini API error:", response.status, data.error || data);
         return jsonResponse(response.status || 500, {
+          error: geminiMsg,
+          message: geminiMsg,
           gemini_error: data.error || data,
-          message: data.error?.message || "API error",
           usage: usagePayload || undefined,
         });
       }
 
-      const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "Empty response from the model";
+      const parts = data?.candidates?.[0]?.content?.parts;
+      const text = Array.isArray(parts)
+        ? parts.map((p) => p.text || "").join("")
+        : "";
+      if (!text) {
+        const blockReason = data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason;
+        return jsonResponse(200, {
+          text: blockReason
+            ? `Empty response from the model (${blockReason})`
+            : "Empty response from the model",
+          usage: usagePayload || undefined,
+        });
+      }
 
       return jsonResponse(200, {
         text,
