@@ -5,7 +5,7 @@
 //   - module.exports.handler(event, context)
 //   - process.env вместо env bindings
 //   - ответы { statusCode, headers, body }
-//   - /generate → Google Gemini 2.5 Flash
+//   - /generate → DeepSeek API (deepseek-chat)
 //   - сессии/OTP: NeonDB kv_store вместо Cloudflare KV
 // ============================================================================
 
@@ -606,7 +606,7 @@ module.exports.handler = async function (event, context) {
     }
   }
 
-  /** Откат списания (например, Gemini упал после pre-charge). */
+  /** Откат списания (например, DeepSeek упал после pre-charge). */
   async function decrementUsageForUser(userId, type) {
     try {
       if (type === "image") {
@@ -1212,6 +1212,7 @@ module.exports.handler = async function (event, context) {
       const info = {
         ok: true,
         hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
+        hasDeepseekKey: Boolean(process.env.DEEPSEEK_API_KEY),
         hasGeminiKey: Boolean(process.env.GEMINI_API_KEY),
         hasGoogleClientId: Boolean(process.env.GOOGLE_CLIENT_ID),
         node: process.version,
@@ -1241,39 +1242,41 @@ module.exports.handler = async function (event, context) {
       }
     }
 
-    // Быстрая проверка Gemini без авторизации (только факт доступа к API)
-    if (httpMethod === "GET" && pathname === "/health/gemini") {
-      const key = String(process.env.GEMINI_API_KEY || "").trim();
+    // Быстрая проверка DeepSeek
+    if (httpMethod === "GET" && pathname === "/health/deepseek") {
+      const key = String(process.env.DEEPSEEK_API_KEY || "").trim();
       if (!key) {
-        return jsonResponse(500, { ok: false, error: "GEMINI_API_KEY missing" });
+        return jsonResponse(500, { ok: false, error: "DEEPSEEK_API_KEY missing" });
       }
       try {
-        const res = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(key)}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ role: "user", parts: [{ text: "Reply with one word: ok" }] }],
-              generationConfig: { maxOutputTokens: 8, temperature: 0 },
-            }),
-          }
-        );
+        const res = await fetch("https://api.deepseek.com/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + key,
+          },
+          body: JSON.stringify({
+            model: "deepseek-chat",
+            messages: [{ role: "user", content: "Reply with one word: ok" }],
+            max_tokens: 8,
+            temperature: 0,
+          }),
+        });
         const data = await res.json().catch(() => ({}));
         if (!res.ok || data.error) {
           return jsonResponse(res.status || 500, {
             ok: false,
             status: res.status,
-            error: data.error?.message || data.message || "Gemini request failed",
-            gemini_error: data.error || data,
+            error: data.error?.message || data.message || "DeepSeek request failed",
+            deepseek_error: data.error || data,
           });
         }
-        const text = data?.candidates?.[0]?.content?.parts?.map((p) => p.text).join("") || "";
-        return jsonResponse(200, { ok: true, text: text.slice(0, 80) });
+        const text = data?.choices?.[0]?.message?.content || "";
+        return jsonResponse(200, { ok: true, text: String(text).slice(0, 80) });
       } catch (err) {
         return jsonResponse(502, {
           ok: false,
-          error: "Cannot reach Gemini: " + (err.message || String(err)),
+          error: "Cannot reach DeepSeek: " + (err.message || String(err)),
         });
       }
     }
@@ -1401,9 +1404,9 @@ module.exports.handler = async function (event, context) {
     }
 
     if (pathname === "/generate" && httpMethod === "POST") {
-      const geminiKey = String(process.env.GEMINI_API_KEY || "").trim();
-      if (!geminiKey) {
-        return jsonResponse(500, { error: "GEMINI_API_KEY not configured" });
+      const deepseekKey = String(process.env.DEEPSEEK_API_KEY || "").trim();
+      if (!deepseekKey) {
+        return jsonResponse(500, { error: "DEEPSEEK_API_KEY not configured" });
       }
 
       const auth = await requireAuth();
@@ -1425,11 +1428,10 @@ module.exports.handler = async function (event, context) {
       }
 
       const skipUsageCharge = Boolean(body?.usageAlreadyCounted);
-      // Списываем как image только если реально пришли данные картинки
       const chargeType = image ? "image" : "request";
       let usagePayload = usageSnapshot(user);
 
-      // Списание ДО вызова Gemini (атомарно).
+      // Списание ДО вызова DeepSeek (атомарно).
       if (!skipUsageCharge) {
         const usageResult = await incrementUsageForUser(userId, chargeType);
         if (usageResult.error) {
@@ -1445,116 +1447,104 @@ module.exports.handler = async function (event, context) {
 
       // === ЛИМИТ ТОКЕНОВ: уважаем то, что просит фронтенд (app.js) ===
       const requestedTokens = Number(body?.maxOutputTokens ?? body?.max_tokens ?? 2048);
-      const maxOutputTokens = Math.max(256, Math.min(Number.isFinite(requestedTokens) ? requestedTokens : 2048, 8192));
+      const maxTokens = Math.max(256, Math.min(Number.isFinite(requestedTokens) ? requestedTokens : 2048, 8192));
 
-      let systemPrompt = "";
-      const contents = [];
-
+      // OpenAI-совместимый формат для DeepSeek
+      const openaiMessages = [];
       for (let i = 0; i < messages.length; i++) {
         const msg = messages[i];
-        const textContent = typeof msg.content === "string" ? msg.content : (msg.content?.[0]?.text || "");
+        const textContent = typeof msg.content === "string"
+          ? msg.content
+          : (msg.content?.[0]?.text || "");
 
         if (msg.role === "system") {
-          systemPrompt += textContent + "\n\n";
+          if (textContent) openaiMessages.push({ role: "system", content: textContent });
           continue;
         }
 
-        const parts = [{ text: textContent }];
-        const role = msg.role === "assistant" ? "model" : "user";
-        contents.push({ role, parts });
+        const role = msg.role === "assistant" ? "assistant" : "user";
+        const isLastMessage = i === messages.length - 1;
+        const isUserMessage = role === "user";
+
+        if (image && isLastMessage && isUserMessage) {
+          const mime = image.mime_type || image.mimeType || "image/jpeg";
+          // deepseek-chat — текстовая модель; картинку передаём как data-URL на случай поддержки,
+          // иначе API вернёт ошибку — её покажем пользователю.
+          openaiMessages.push({
+            role: "user",
+            content: [
+              { type: "text", text: textContent || "Analyze image" },
+              {
+                type: "image_url",
+                image_url: { url: `data:${mime};base64,${image.data}` },
+              },
+            ],
+          });
+        } else {
+          openaiMessages.push({ role, content: textContent });
+        }
       }
 
-      if (!contents.length) {
+      if (!openaiMessages.length) {
         if (!skipUsageCharge) {
           const refunded = await decrementUsageForUser(userId, chargeType);
           if (refunded) usagePayload = usageSnapshot(refunded);
         }
         return jsonResponse(400, {
-          error: "No user/assistant messages to send to Gemini",
+          error: "No messages to send to DeepSeek",
           usage: usagePayload || undefined,
         });
-      }
-
-      // Картинка — в последнее сообщение пользователя
-      if (image) {
-        for (let i = contents.length - 1; i >= 0; i--) {
-          if (contents[i].role === "user") {
-            contents[i].parts.push({
-              inlineData: {
-                mimeType: image.mime_type || image.mimeType || "image/jpeg",
-                data: image.data,
-              },
-            });
-            break;
-          }
-        }
-      }
-
-      const requestBody = {
-        contents,
-        generationConfig: { temperature: body?.temperature ?? 0.7, maxOutputTokens },
-      };
-      if (systemPrompt.trim()) {
-        requestBody.systemInstruction = { parts: [{ text: systemPrompt.trim() }] };
       }
 
       let response;
       let data = {};
       try {
-        response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${encodeURIComponent(geminiKey)}`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(requestBody),
-          }
-        );
+        response = await fetch("https://api.deepseek.com/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: "Bearer " + deepseekKey,
+          },
+          body: JSON.stringify({
+            model: "deepseek-chat",
+            messages: openaiMessages,
+            temperature: body?.temperature ?? 0.7,
+            max_tokens: maxTokens,
+          }),
+        });
         data = await response.json().catch(() => ({}));
-      } catch (geminiNetErr) {
-        console.error("[generate] Gemini network error:", geminiNetErr);
+      } catch (netErr) {
+        console.error("[generate] DeepSeek network error:", netErr);
         if (!skipUsageCharge) {
           const refunded = await decrementUsageForUser(userId, chargeType);
           if (refunded) usagePayload = usageSnapshot(refunded);
         }
         return jsonResponse(502, {
-          error: "Cannot reach Google Gemini from Yandex Cloud: " + (geminiNetErr.message || String(geminiNetErr)),
+          error: "Cannot reach DeepSeek: " + (netErr.message || String(netErr)),
           usage: usagePayload || undefined,
         });
       }
 
       if (!response.ok || data.error) {
-        // Gemini упал после списания — возвращаем квоту
         if (!skipUsageCharge) {
           const refunded = await decrementUsageForUser(userId, chargeType);
           if (refunded) usagePayload = usageSnapshot(refunded);
         }
-        const geminiMsg =
+        const errMsg =
           data.error?.message ||
           data.message ||
           (typeof data.error === "string" ? data.error : null) ||
-          `Gemini HTTP ${response.status}`;
-        console.error("[generate] Gemini API error:", response.status, data.error || data);
+          `DeepSeek HTTP ${response.status}`;
+        console.error("[generate] DeepSeek API error:", response.status, data.error || data);
         return jsonResponse(response.status || 500, {
-          error: geminiMsg,
-          message: geminiMsg,
-          gemini_error: data.error || data,
+          error: errMsg,
+          message: errMsg,
+          deepseek_error: data.error || data,
           usage: usagePayload || undefined,
         });
       }
 
-      const parts = data?.candidates?.[0]?.content?.parts;
-      const text = Array.isArray(parts)
-        ? parts.map((p) => p.text || "").join("")
-        : "";
-      if (!text) {
-        const blockReason = data?.candidates?.[0]?.finishReason || data?.promptFeedback?.blockReason;
-        return jsonResponse(200, {
-          text: blockReason
-            ? `Empty response from the model (${blockReason})`
-            : "Empty response from the model",
-          usage: usagePayload || undefined,
-        });
-      }
+      const text = data?.choices?.[0]?.message?.content || "Empty response from the model";
 
       return jsonResponse(200, {
         text,
