@@ -2168,15 +2168,6 @@ function applyUsageFromServer(usage) {
  * Кидает ошибку только при реальном лимите (429/403 LIMIT_*).
  * Сетевые/500 ошибки — return null: тогда /generate сам спишет квоту.
  */
-/** Настоящий data-URL картинки; пустые/битые вложения не считаем image. */
-function normalizeAttachedImageData(data) {
-    if (!data || typeof data !== 'string') return null;
-    const s = data.trim();
-    if (!s.startsWith('data:image/')) return null;
-    if (s.length < 64) return null;
-    return s;
-}
-
 async function consumeUsageOnServer(type = 'request') {
     if (!isUserLoggedIn()) return null;
     let res;
@@ -2200,17 +2191,14 @@ async function consumeUsageOnServer(type = 'request') {
         return data;
     }
     const code = data.code || '';
-    // Только явные LIMIT_* — НЕ любой 403 (Forbidden после смены воркера раньше
-    // ошибочно открывал модалку «Лимит изображений» на обычном текстовом вопросе).
-    const isLimit =
-        code === 'LIMIT_REQUESTS' ||
-        code === 'LIMIT_IMAGES' ||
-        code === 'LIMIT_QUIZ' ||
-        (res.status === 429 && (type === 'request' || type === 'image' || type === 'quiz'));
+    // Только явные LIMIT_* / 429. Голый 403 Forbidden (mismatch сессии и т.п.)
+    // раньше ошибочно открывал «Лимит изображений» на обычном текстовом вопросе.
+    const isLimit = code === 'LIMIT_REQUESTS' || code === 'LIMIT_IMAGES' || code === 'LIMIT_QUIZ' ||
+        (res.status === 429 && (code.startsWith('LIMIT_') || !code));
     if (isLimit) {
         const err = new Error(data.error || 'Usage limit');
         err.status = res.status;
-        err.code = code || (type === 'image' ? 'LIMIT_IMAGES' : type === 'quiz' ? 'LIMIT_QUIZ' : 'LIMIT_REQUESTS');
+        err.code = code || (type === 'image' ? 'LIMIT_IMAGES' : 'LIMIT_REQUESTS');
         throw err;
     }
     // Worker ещё не задеплоен / SQL глюк / 403 Forbidden — не блокируем чат
@@ -3544,21 +3532,22 @@ async function deliverAiReplyToChat(chatId, text, { withTyping = true } = {}) {
     }
 }
 
+function normalizeImagePayload(imageData) {
+    if (!imageData || typeof imageData !== 'string') return null;
+    const trimmed = imageData.trim();
+    if (!trimmed || trimmed.length < 32) return null;
+    return trimmed;
+}
+
 async function generateResponse(query, imageData = null) {
-    imageData = normalizeAttachedImageData(imageData);
+    imageData = normalizeImagePayload(imageData);
     if (getRemainingRequests() <= 0) { showNoRequestsToast(); refreshSendButtonState(); return; }
     if (imageData && getRemainingImages() <= 0) { 
-        // Текст без картинки — продолжаем; только image-only блокируем
-        if (!(query && String(query).trim())) {
-            refreshImageAttachVisibility();
-            showImageLimitModal(); 
-            attachedFiles = []; 
-            if (typeof chatAttachedFiles !== 'undefined' && chatAttachedFiles) chatAttachedFiles.innerHTML = ''; 
-            return;
-        }
-        imageData = null;
-        attachedFiles = [];
-        if (typeof chatAttachedFiles !== 'undefined' && chatAttachedFiles) chatAttachedFiles.innerHTML = '';
+        refreshImageAttachVisibility();
+        showImageLimitModal(); 
+        attachedFiles = []; 
+        if (typeof chatAttachedFiles !== 'undefined') chatAttachedFiles.innerHTML = ''; 
+        return; 
     }
     if (isHarmonizationTask(query, !!imageData) && !notationModeEnabled) {
         try {
@@ -3985,7 +3974,9 @@ function restorePendingQueryAfterLogin() {
         if (!raw) return;
         const pq = JSON.parse(raw);
         sessionStorage.removeItem('solfai_pending_query');
-        if (pq?.query) proceedWithQuery(pq.query, pq.imageData);
+        if (pq?.query || normalizeImagePayload(pq?.imageData)) {
+            proceedWithQuery(pq.query || '', normalizeImagePayload(pq.imageData));
+        }
     } catch (_) {}
 }
 
@@ -4097,41 +4088,24 @@ function scheduleSkipChatInputFocusCleanup() {
 }
 
 function proceedWithQuery(query, imageData) {
-    imageData = normalizeAttachedImageData(imageData);
     const clamped = clampChatMessage(query || '');
     query = clamped.text;
     if (!currentChatId) { createNewChat(query || 'Image'); chatTitle.textContent = (query || 'Image').slice(0, 30); }
     const chat = chats.find(c => c.id === currentChatId);
     window.__solfaiResponseLang = detectResponseLanguage(query, chat?.messages);
     chatAttachedFiles.innerHTML = ''; chatInput.value = ''; chatInput.style.height = 'auto';
-    attachedFiles = [];
     chat.messages.push({ role: 'user', content: query || 'Analyze', attachments: imageData ? [{ type: 'image/png', data: imageData }] : [], time: new Date().toISOString(), id: Date.now().toString() });
     saveChatToStorage();
     addMessageToUI('user', query || uiText('analyzeImage', { chat: true, fallback: 'Analyze image' }), imageData ? [{ type: 'image/png', data: imageData }] : []);
-    generateResponse(query, imageData);
+    generateResponse(query, imageData); attachedFiles = [];
     if (isMobileLayout()) dismissMobileChatKeyboard();
 }
 
 function sendChatMessage() {
     let query = chatInput.value.trim();
-    const imageData = normalizeAttachedImageData(attachedFiles[0]?.data || null);
+    const imageData = normalizeImagePayload(attachedFiles[0]?.data || null);
     if (getRemainingRequests() <= 0) { showNoRequestsToast(); refreshSendButtonState(); return; }
     if ((!query && !imageData) || isGenerating) return;
-    // Нет квоты на картинки — не блокируем текстовый вопрос модалкой image-limit
-    if (imageData && getRemainingImages() <= 0) {
-        if (!query) {
-            showImageLimitModal();
-            return;
-        }
-        attachedFiles = [];
-        if (chatAttachedFiles) chatAttachedFiles.innerHTML = '';
-        showToast(
-            uiText('imageQuotaSkipped', { fallback: 'Image limit reached — sending text only' }),
-            'info',
-            { dedupeKey: 'img-skip' }
-        );
-    }
-    const imageForSend = (imageData && getRemainingImages() > 0) ? imageData : null;
 
     const clamped = clampChatMessage(query);
     if (clamped.truncated) {
@@ -4147,8 +4121,8 @@ function sendChatMessage() {
     }
 
     lastUserQuery = query;
-    if (!currentUser) { pendingQuery = { query, imageData: imageForSend }; showLoginPrompt(); return; }
-    proceedWithQuery(query, imageForSend);
+    if (!currentUser) { pendingQuery = { query, imageData }; showLoginPrompt(); return; }
+    proceedWithQuery(query, imageData);
 }
 
 function updateUIForUser(options = {}) {

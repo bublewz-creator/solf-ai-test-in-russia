@@ -793,7 +793,7 @@ module.exports.handler = async function (event, context) {
   }
 
   function forbidSelfOnly(sessionUserId, targetUserId) {
-    if (!targetUserId || String(sessionUserId) !== String(targetUserId)) {
+    if (!targetUserId || sessionUserId !== targetUserId) {
       return jsonResponse(403, { error: "Forbidden", code: "FORBIDDEN" });
     }
     return null;
@@ -1372,7 +1372,10 @@ module.exports.handler = async function (event, context) {
       if (auth.error) return auth.error;
 
       const messages = body?.messages || [];
-      const image = body?.image;
+      const rawImage = body?.image;
+      const image = (rawImage && typeof rawImage === "object" && rawImage.data && String(rawImage.data).length > 32)
+        ? rawImage
+        : null;
       const userId = body?.userId || body?.user_id || auth.userId;
 
       const forbid = forbidSelfOnly(auth.userId, userId);
@@ -1384,6 +1387,7 @@ module.exports.handler = async function (event, context) {
       }
 
       const skipUsageCharge = Boolean(body?.usageAlreadyCounted);
+      // Списываем как image только если реально пришли данные картинки
       const chargeType = image ? "image" : "request";
       let usagePayload = usageSnapshot(user);
 
