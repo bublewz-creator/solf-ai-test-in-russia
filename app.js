@@ -551,48 +551,6 @@ let currentTheme = localStorage.getItem('solfai_theme') || 'default';
 let currentColor = localStorage.getItem('solfai_color') || 'default';
 let currentFontSize = localStorage.getItem('solfai_font_size') || 'md';
 
-// ===== РЕЖИМЫ AI =====
-let currentAiMode = 'normal';
-const modeToggleBtn = document.getElementById('mode-toggle-btn');
-const modeDropdown = document.getElementById('mode-dropdown');
-const modeOptions = document.querySelectorAll('.mode-option');
-
-if (modeToggleBtn && modeDropdown) {
-    modeToggleBtn.addEventListener('click', (e) => {
-        e.stopPropagation();
-        closeAllOverlays(modeToggleBtn);
-        modeDropdown.classList.toggle('hidden');
-    });
-
-    modeOptions.forEach(option => {
-        option.addEventListener('click', (e) => {
-            const target = e.currentTarget;
-            const nextMode = target?.dataset?.mode;
-            if (!nextMode) return;
-
-            currentAiMode = nextMode;
-
-            // Копируем содержимое выбранной опции (SVG + span с data-i18n) в главную кнопку
-            modeToggleBtn.innerHTML = target.innerHTML;
-
-            // Активный пункт
-            modeOptions.forEach(opt => opt.classList.remove('active'));
-            target.classList.add('active');
-
-            modeDropdown.classList.add('hidden');
-
-            // Обновляем переводы (после замены innerHTML в кнопке)
-            if (typeof updateTexts === 'function') updateTexts();
-        });
-    });
-
-    document.addEventListener('click', (e) => {
-        if (!e.target.closest('.mode-selector-island')) {
-            modeDropdown.classList.add('hidden');
-        }
-    });
-}
-
 // ===== РЕЖИМ НОТНОЙ ЗАПИСИ =====
 let notationModeEnabled = false;
 const notationToggleBtn = document.getElementById('notation-toggle-btn');
@@ -637,7 +595,7 @@ const NOTATION_PROMPT_INSTRUCTION = `
 ###  NOTATION MODE — MANDATORY OUTPUT     ###
 ############################################
 
-NOTATION MODE IS ON. These rules OVERRIDE every other instruction (including any “long”, “verbose”, or “berserk” style). You MUST always draw notes in the answer.
+NOTATION MODE IS ON. These rules OVERRIDE every other instruction. You MUST always draw notes in the answer.
 
 TASK COMPLIANCE (ПРИОРИТЕТ №1 — выше истории чата и стиля ответа):
 - Выполняй ТОЛЬКО то, что просит пользователь в ЭТОМ сообщении — полностью, без сокращений и без «похожего примера».
@@ -918,11 +876,6 @@ REMEMBER:
 function getSystemInstruction(responseLang, userQuery) {
     const lang = responseLang || detectResponseLanguage('', []);
     let prompt = SYSTEM_PROMPT + getLanguageInstruction(lang);
-    if (currentAiMode === 'berserk' && !notationModeEnabled) {
-        prompt += lang === 'ru'
-            ? `\n\nStyle: Be максимально прямолинейным и резким по тону, но без мата, унижений и личных оскорблений. Коротко, по делу, с сарказмом допускается, но всегда давай корректный и полезный ответ.`
-            : `\n\nStyle: Be blunt and direct, but no slurs or personal insults. Short, useful answers; light sarcasm is fine.`;
-    }
     const cleanQuery = stripNotationReminder(userQuery);
     if (notationModeEnabled) {
         prompt += NOTATION_PROMPT_INSTRUCTION;
@@ -1630,10 +1583,6 @@ function closeAllOverlays(exceptElement = null) {
         resetSidebarExpandedMenus();
     }
 
-    if (modeDropdown && (!exceptElement || !exceptElement.closest?.('.mode-selector-island'))) {
-        modeDropdown.classList.add('hidden');
-    }
-
     const dropdownSelectors = ['.lang-submenu', '.lang-dropdown', '.profile-dropdown'];
     dropdownSelectors.forEach(sel => {
         document.querySelectorAll(sel).forEach(dropdown => {
@@ -1731,19 +1680,20 @@ function enforceChatLimit() {
 function renderChatItemHTML(chat) {
     const isActive = (typeof currentChatId !== 'undefined' && currentChatId === chat.id) ? 'active' : '';
     const isGeneratingHere = isChatGenerating(chat.id);
-    let title = chat.title || 'New Chat';
+    const safeId = String(chat.id || '').replace(/[^a-zA-Z0-9_-]/g, '');
+    let title = escapeHtml(chat.title || 'New Chat');
     if (isGeneratingHere && !isActive) title = `${title} …`;
     const isPinned = chat.pinned ? 'is-pinned' : '';
     const pinFill = chat.pinned ? 'currentColor' : 'none';
 
     return `
-    <div class="chat-item ${isActive}" data-id="${chat.id}">
+    <div class="chat-item ${isActive}" data-id="${safeId}">
         <div class="chat-title-wrapper">${title}</div>
         <div class="chat-actions" style="${chat.pinned ? 'display: flex;' : ''}">
-            <button class="chat-action-btn pin ${isPinned}" onclick="togglePinChat('${chat.id}', event)" title="Pin">
+            <button class="chat-action-btn pin ${isPinned}" onclick="togglePinChat('${safeId}', event)" title="Pin">
                 <svg class="svg-icon" style="width: 14px; height: 14px; fill: ${pinFill};" viewBox="0 0 24 24"><path d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"/></svg>
             </button>
-            <button class="chat-action-btn delete" onclick="deleteChatFromSidebar('${chat.id}', event)" title="Delete">
+            <button class="chat-action-btn delete" onclick="deleteChatFromSidebar('${safeId}', event)" title="Delete">
                 <svg class="svg-icon" style="width: 14px; height: 14px;" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
             </button>
         </div>
@@ -2273,7 +2223,14 @@ function showToast(message, type = 'success', options = {}) {
     }
     const toast = document.createElement('div'); toast.className = `toast ${type}`;
     if (dedupeKey) toast.dataset.toastDedupe = dedupeKey;
-    toast.innerHTML = `<span class="toast-icon">${type === 'success' ? '✓' : '✕'}</span><span>${message}</span>`;
+    toast.textContent = '';
+    const icon = document.createElement('span');
+    icon.className = 'toast-icon';
+    icon.textContent = type === 'success' ? '✓' : '✕';
+    const label = document.createElement('span');
+    label.textContent = String(message || '');
+    toast.appendChild(icon);
+    toast.appendChild(label);
     container.appendChild(toast);
     if (dismissOnClick) {
         const removeToast = () => {
@@ -2510,6 +2467,14 @@ function repairTruncatedNotation(fragment) {
     }
 }
 
+function escapeHtml(text) {
+    return String(text)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+}
+
 function escapeNotationAttr(json) {
     return String(json)
         .replace(/&/g, '&amp;')
@@ -2553,8 +2518,8 @@ function formatMessage(text) {
         }
     }
 
-    // 2) Базовое форматирование текста (без нотации)
-    let html = working
+    // 2) Базовое форматирование текста (без нотации). HTML экранируем — иначе XSS из чата/модели.
+    let html = escapeHtml(working)
         .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
         .replace(/\n/g, '<br>');
 
@@ -3759,7 +3724,6 @@ async function generateResponse(query, imageData = null) {
                 data.error?.message ||
                 (typeof data.error === 'string' ? data.error : null) ||
                 data.deepseek_error?.message ||
-                data.gemini_error?.message ||
                 'API Error';
             throw new Error(detailedError);
         }
