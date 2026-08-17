@@ -713,6 +713,14 @@ MULTIPLE BLOCKS — HARD TASKS ONLY:
 WRAPPING NOTES TO TWO LINES:
 - One [[NOTATION:...]] block can hold many notes; the renderer auto-wraps to a second staff line ONLY when needed. So: short example → it stays on one line; long progression (≥ ~3 measures of 4/4) → automatically becomes two lines. Trust the renderer — never split a single progression into multiple blocks just to force a line break.
 
+SONGS / MELODIES / «песенка» / куплет / мотив / «напиши мелодию»:
+- Exactly ONE [[NOTATION]] block. barlines:"auto" + timeSignature (usually "4/4").
+- Continuous melody: successive SINGLE pitches in notes[] (e.g. c/4, d/4, e/4, f/4, g/4…). 4–8 measures is enough for a simple verse.
+- Do NOT split the song into many tiny blocks or one-measure-per-block.
+- Do NOT insert extra measures that are only T53/D7 whole-note stacks between melody notes. That looks like broken sheet music.
+- Harmony: either stack chord tones on the SAME beat as the melody, or put "label":"T53" / "D7" on a melody note of that measure. Never a separate whole-note chord measure.
+- The renderer keeps short tunes on ONE staff (phone: sideways scroll). Trust it.
+
 JSON / DURATIONS:
 - Group durations so each measure sums to the time signature (4/4 → 4 quarter beats; 3/4 → 3; 6/8 → 6 eighths). Mixing durations is fine.
 - Use rests ("qr","hr"…) to fill partial measures.
@@ -3340,16 +3348,21 @@ function renderNotationCard(container, data) {
 
         const containerW = container.clientWidth || container.parentElement?.clientWidth || 600;
         const hasLabels = rawNotes.some(n => n && n.label);
+        const narrow = containerW < 480;
+        // Короткая мелодия/песенка (до 8 тактов) — одна строка, на телефоне скролл вбок.
+        // Иначе на узком экране каждый такт падает на свой стан с новым ключом.
+        const isShortTune = barlinesMode === 'auto' && measures.length > 0 && measures.length <= 8;
         const preferSingleLine = (barlinesMode === 'manual' && measures.length <= 6)
-            || (barlinesMode === 'none' && rawNotes.length <= 12);
+            || (barlinesMode === 'none' && rawNotes.length <= 12)
+            || isShortTune;
         const maxW = preferSingleLine
-            ? Math.max(containerW - 16, 520)
+            ? Math.max(containerW - 16, isShortTune ? 640 : 520)
             : Math.min(Math.max(containerW - 16, 280), 960);
 
-        const FIRST_OVERHEAD = 100;
+        const FIRST_OVERHEAD = narrow ? 86 : 100;
         const NEXT_OVERHEAD = 14;
-        const PER_NOTE = hasLabels ? 40 : 28;
-        const MIN_MEASURE = hasLabels ? 100 : 88;
+        const PER_NOTE = hasLabels ? (narrow ? 30 : 40) : (narrow ? 22 : 28);
+        const MIN_MEASURE = hasLabels ? (narrow ? 84 : 100) : (narrow ? 72 : 88);
         const measureBaseW = m => Math.max(MIN_MEASURE, m.length * PER_NOTE + 22);
 
         // Раскладка тактов по строкам с переносом
@@ -3392,9 +3405,9 @@ function renderNotationCard(container, data) {
             }
         });
 
-        const ROW_HEIGHT = 132;
-        const TOP_PAD = 12;
-        const totalHeight = rows.length * ROW_HEIGHT + TOP_PAD + 32;
+        const ROW_HEIGHT = hasLabels ? 128 : 108;
+        const TOP_PAD = 10;
+        const totalHeight = rows.length * ROW_HEIGHT + TOP_PAD + (hasLabels ? 28 : 18);
         const rowPixelW = rows.reduce((mx, r) => Math.max(mx, r.reduce((s, mm) => s + mm.width, 0)), 0);
         const totalWidth = Math.max(maxW + 16, rowPixelW + 16);
 
