@@ -115,10 +115,10 @@
          шрифты подменятся. Если CSS вообще не придёт — страница работает с системными. -->
     <link rel="preconnect" href="https://fonts.googleapis.com" crossorigin>
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Ephesis&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap"
+    <link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@1,400;1,500&family=Ephesis&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap"
           rel="stylesheet" media="print" onload="this.media='all';this.onload=null;"
           onerror="this.onerror=null;this.remove();">
-    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Ephesis&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap"></noscript>
+    <noscript><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@1,400;1,500&family=Ephesis&family=Inter:wght@300;400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap"></noscript>
     <!-- Google Sign-In: грузим ЛЕНИВО, только при попытке входа (см. ensureGoogleSignInLoaded
          в app.js). Это убирает accounts.google.com из критического пути загрузки — у части
          пользователей без VPN запрос подвисает на несколько секунд и тормозит весь UI. -->
@@ -199,9 +199,14 @@
             color: var(--purple-soft);
         }
         .empty-chat-state .chat-subtitle {
-            margin-top: 2px;
-            font-size: 1.05rem;
+            margin-top: 6px;
+            font-family: 'Cormorant Garamond', 'Times New Roman', serif;
+            font-style: italic;
             font-weight: 400;
+            font-size: 1.45rem;
+            line-height: 1.35;
+            letter-spacing: 0.03em;
+            color: var(--text-secondary);
         }
         
         .chat-input-container {
@@ -284,7 +289,7 @@
         .chat-action-btn:hover { color: var(--text-primary); background: rgba(139,92,246,0.15); }
         .chat-action-btn.delete:hover { color: #ef4444; background: rgba(239,68,68,0.15); }
         .chat-action-btn.pin.is-pinned { color: var(--purple-glow); display: flex !important; }
-        @media (max-width: 768px) { .chat-actions { display: flex; } .empty-chat-state h1 { font-size: 4.4rem; } }
+        @media (max-width: 768px) { .chat-actions { display: flex; } .empty-chat-state h1 { font-size: 4.4rem; } .empty-chat-state .chat-subtitle { font-size: 1.22rem; } }
     </style>
 </head>
 <body class="preload">
