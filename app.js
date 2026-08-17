@@ -201,13 +201,16 @@ function chatFreshnessScore(c) {
 
 /** Слияние локальной и серверной версии одного чата. pinned — OR с обеих сторон. */
 function mergeChatRecords(local, server) {
-    const localFresher = chatFreshnessScore(local) > chatFreshnessScore(server);
+    const localScore = chatFreshnessScore(local);
+    const serverScore = chatFreshnessScore(server);
+    const localFresher = localScore >= serverScore;
     const messages = (local.messages?.length || 0) >= (server.messages?.length || 0)
         ? (local.messages || [])
         : (server.messages || []);
+    const base = localFresher ? { ...server, ...local } : { ...local, ...server };
     return {
-        ...(localFresher ? { ...server, ...local } : { ...local, ...server }),
-        pinned: !!(local.pinned || server.pinned),
+        ...base,
+        pinned: localFresher ? !!local.pinned : !!server.pinned,
         messages,
     };
 }
@@ -272,7 +275,7 @@ function scheduleServerSync(reason = '') {
     if (__serverSyncInflight) return __serverSyncInflight;
     const now = Date.now();
     // focus/visibility могут сыпаться часто — не долбим БД чаще раза в 8 сек
-    if (reason !== 'initApp' && reason !== 'updateUIForUser' && reason !== 'pinChat' && (now - __serverSyncLastAt) < SERVER_SYNC_MIN_INTERVAL_MS) {
+    if (reason !== 'initApp' && reason !== 'updateUIForUser' && (now - __serverSyncLastAt) < SERVER_SYNC_MIN_INTERVAL_MS) {
         return Promise.resolve();
     }
     __serverSyncLastAt = now;
@@ -1757,7 +1760,6 @@ window.togglePinChat = function(id, e) {
     saveChatToStorage();
     saveChatToServer(chat);
     renderChatsList();
-    scheduleServerSync('pinChat');
 };
 
 window.deleteChatFromSidebar = function(id, e) {
@@ -1862,8 +1864,7 @@ function setTheme(theme) {
     if (typeof persistUiPrefs === 'function') persistUiPrefs();
 }
 function initTheme() {
-    window.__solfSkipPrefPersist = true;
-    try { setTheme(currentTheme); } finally { window.__solfSkipPrefPersist = false; }
+    setTheme(currentTheme);
     window.addEventListener('storage', (e) => {
         if (e.key === 'solfai_theme' && e.newValue) {
             currentTheme = e.newValue;
@@ -1897,8 +1898,7 @@ function setColor(color) {
 }
 
 function initColor() {
-    window.__solfSkipPrefPersist = true;
-    try { setColor(currentColor); } finally { window.__solfSkipPrefPersist = false; }
+    setColor(currentColor);
 }
 
 function setFontSize(size) {
@@ -1909,8 +1909,7 @@ function setFontSize(size) {
 }
 
 function initFontSize() {
-    window.__solfSkipPrefPersist = true;
-    try { setFontSize(currentFontSize); } finally { window.__solfSkipPrefPersist = false; }
+    setFontSize(currentFontSize);
 }
 
 // ===== ТАРИФЫ И КНОПКА UPGRADE =====
@@ -2310,7 +2309,7 @@ function saveChatToServer(chat) {
     apiFetch(workerApi('/save-chat'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...chat, user_id: currentUser.id })
+        body: JSON.stringify({ ...chat, pinned: !!chat.pinned, user_id: currentUser.id })
     }).catch(err => console.error('Failed to save chat:', err));
 }
 
@@ -4481,12 +4480,16 @@ async function initApp() {
     migrateRemoveStaleUsageKeysOnce();
     // КРИТИЧНО: НЕ ждём sync. UI сразу с кэша; БД (квота + чаты) догоняет в фоне.
     scheduleServerSync('initApp');
-    initTheme();
-    initColor();
-    initFontSize();
-
-    if (typeof setLanguage === 'function' && typeof currentLang !== 'undefined') {
-        setLanguage(currentLang); 
+    window.__solfSkipPrefPersist = true;
+    try {
+        initTheme();
+        initColor();
+        initFontSize();
+        if (typeof setLanguage === 'function' && typeof currentLang !== 'undefined') {
+            setLanguage(currentLang);
+        }
+    } finally {
+        window.__solfSkipPrefPersist = false;
     }
     
     // ВСЕГДА вызываем updateUIForUser, не только для гостей. Раньше тут было

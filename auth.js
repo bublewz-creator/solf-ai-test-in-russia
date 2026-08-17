@@ -79,7 +79,7 @@ function collectUiPrefs() {
 let persistUiPrefsTimer = null;
 let uiPrefsDirty = false;
 
-function persistUiPrefs() {
+function persistUiPrefs(immediate) {
     if (window.__solfSkipPrefPersist) return;
     if (typeof getSolfSessionToken !== 'function' || !getSolfSessionToken()) return;
     let user = null;
@@ -87,46 +87,75 @@ function persistUiPrefs() {
     if (!user?.id) return;
     uiPrefsDirty = true;
     clearTimeout(persistUiPrefsTimer);
-    persistUiPrefsTimer = setTimeout(() => {
+
+    const send = () => {
+        const payload = collectUiPrefs();
         fetch(workerApi('/save-prefs'), {
             method: 'POST',
             headers: solfAuthHeaders({ 'Content-Type': 'application/json' }),
-            body: JSON.stringify(collectUiPrefs()),
-        }).then((res) => {
-            if (res && res.ok) uiPrefsDirty = false;
+            body: JSON.stringify(payload),
+        }).then(async (res) => {
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data && data.ok !== false && !data.error && !data.skipped) {
+                uiPrefsDirty = false;
+            }
         }).catch(() => {});
-    }, 250);
+    };
+
+    if (immediate) send();
+    else persistUiPrefsTimer = setTimeout(send, 250);
+}
+
+function applyUiPrefValue(kind, value) {
+    if (kind === 'color') {
+        localStorage.setItem('solfai_color', value);
+        if (typeof setColor === 'function') setColor(value);
+        else if (value === 'default') document.documentElement.removeAttribute('data-color');
+        else document.documentElement.setAttribute('data-color', value);
+        return;
+    }
+    if (kind === 'theme') {
+        localStorage.setItem('solfai_theme', value);
+        if (typeof setTheme === 'function') setTheme(value);
+        else if (value === 'light') document.documentElement.setAttribute('data-theme', 'light');
+        else document.documentElement.removeAttribute('data-theme');
+        return;
+    }
+    if (kind === 'lang') {
+        localStorage.setItem('solfai_lang', value);
+        if (typeof setLanguage === 'function') setLanguage(value);
+        return;
+    }
+    localStorage.setItem('solfai_font_size', value);
+    if (typeof setFontSize === 'function') setFontSize(value);
+    else document.documentElement.setAttribute('data-font-size', value);
 }
 
 function applyUiPrefsFromServer(user) {
-    if (!user || uiPrefsDirty) return;
+    if (!user) return;
     const hasServerPrefs = !!(user.ui_color || user.ui_theme || user.ui_lang || user.ui_font);
-    if (!hasServerPrefs) return;
+    if (!hasServerPrefs) {
+        setTimeout(() => persistUiPrefs(), 0);
+        return;
+    }
+    if (uiPrefsDirty) return;
 
     window.__solfSkipPrefPersist = true;
     try {
-        if (UI_PREF_ALLOWED.color.includes(user.ui_color)) {
-            localStorage.setItem('solfai_color', user.ui_color);
-            if (typeof setColor === 'function') setColor(user.ui_color);
-            else if (user.ui_color === 'default') document.documentElement.removeAttribute('data-color');
-            else document.documentElement.setAttribute('data-color', user.ui_color);
-        }
-        if (UI_PREF_ALLOWED.theme.includes(user.ui_theme)) {
-            localStorage.setItem('solfai_theme', user.ui_theme);
-            if (typeof setTheme === 'function') setTheme(user.ui_theme);
-            else if (user.ui_theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
-            else document.documentElement.removeAttribute('data-theme');
-        }
-        if (UI_PREF_ALLOWED.lang.includes(user.ui_lang)) {
-            localStorage.setItem('solfai_lang', user.ui_lang);
-            if (typeof setLanguage === 'function') setLanguage(user.ui_lang);
-        }
-        if (UI_PREF_ALLOWED.font.includes(user.ui_font)) {
-            localStorage.setItem('solfai_font_size', user.ui_font);
-            if (typeof setFontSize === 'function') setFontSize(user.ui_font);
-            else document.documentElement.setAttribute('data-font-size', user.ui_font);
-        }
+        if (UI_PREF_ALLOWED.color.includes(user.ui_color)) applyUiPrefValue('color', user.ui_color);
+        if (UI_PREF_ALLOWED.theme.includes(user.ui_theme)) applyUiPrefValue('theme', user.ui_theme);
+        if (UI_PREF_ALLOWED.lang.includes(user.ui_lang)) applyUiPrefValue('lang', user.ui_lang);
+        if (UI_PREF_ALLOWED.font.includes(user.ui_font)) applyUiPrefValue('font', user.ui_font);
     } finally {
         window.__solfSkipPrefPersist = false;
     }
+}
+
+if (typeof window !== 'undefined') {
+    window.addEventListener('pagehide', () => {
+        if (uiPrefsDirty) persistUiPrefs(true);
+    });
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden' && uiPrefsDirty) persistUiPrefs(true);
+    });
 }

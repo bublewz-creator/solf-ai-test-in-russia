@@ -144,6 +144,61 @@ export default {
     function pickUiPref(value, allowed) {
       return allowed.has(value) ? value : null;
     }
+    function uiPrefsKey(userId) {
+      return "ui_prefs:" + userId;
+    }
+    function normalizeUiPrefs(raw) {
+      if (!raw || typeof raw !== "object") return null;
+      const color = pickUiPref(raw.color || raw.ui_color, UI_PREF_ALLOWED.color);
+      const theme = pickUiPref(raw.theme || raw.ui_theme, UI_PREF_ALLOWED.theme);
+      const lang = pickUiPref(raw.lang || raw.ui_lang, UI_PREF_ALLOWED.lang);
+      const font = pickUiPref(raw.font || raw.ui_font, UI_PREF_ALLOWED.font);
+      if (!color && !theme && !lang && !font) return null;
+      return { color, theme, lang, font };
+    }
+    function parseUiPrefsValue(raw) {
+      if (!raw) return null;
+      try {
+        return normalizeUiPrefs(typeof raw === "string" ? JSON.parse(raw) : raw);
+      } catch (_) {
+        return null;
+      }
+    }
+    function prefsToUserFields(prefs) {
+      return {
+        ui_color: (prefs && prefs.color) || null,
+        ui_theme: (prefs && prefs.theme) || null,
+        ui_lang: (prefs && prefs.lang) || null,
+        ui_font: (prefs && prefs.font) || null,
+      };
+    }
+    async function readUiPrefs(env, userId) {
+      const store = sessionStore(env);
+      if (!store || !userId) return null;
+      try {
+        return parseUiPrefsValue(await store.get(uiPrefsKey(userId)));
+      } catch (_) {
+        return null;
+      }
+    }
+    async function writeUiPrefs(env, userId, prefs) {
+      const store = sessionStore(env);
+      if (!store) throw new Error("prefs store missing");
+      await store.put(uiPrefsKey(userId), JSON.stringify({
+        color: prefs.color || null,
+        theme: prefs.theme || null,
+        lang: prefs.lang || null,
+        font: prefs.font || null,
+      }));
+    }
+    async function attachUiPrefs(env, user) {
+      if (!user || !user.id) return user;
+      const fromKv = await readUiPrefs(env, user.id);
+      const fromCols = normalizeUiPrefs(user);
+      const prefs = fromKv || fromCols;
+      if (!prefs) return user;
+      return { ...user, ...prefsToUserFields(prefs) };
+    }
     async function ensureUiPrefsColumns() {
       if (uiPrefsReady) return true;
       try {
@@ -962,7 +1017,7 @@ export default {
         // Раньше клиент слал prev_plan (часто устаревший/free после очистки кэша),
         // и сервер ошибочно считал это апгрейдом → обнулял requests_count в БД
         // (40/50 превращалось в 50/50 на всех устройствах). Refill только в /update-plan.
-        const user = await getUserWithFreshUsage(userId);
+        const user = await attachUiPrefs(env, await getUserWithFreshUsage(userId));
         if (!user) return new Response(JSON.stringify({ error: "Not found" }), { status: 404, headers: corsHeaders });
 
         return new Response(JSON.stringify(user), { headers: corsHeaders });
@@ -1016,34 +1071,41 @@ export default {
         const auth = await requireAuth(request, env);
         if (auth.error) return auth.error;
 
-        const colsOk = await ensureUiPrefsColumns();
-        if (!colsOk) return new Response(JSON.stringify({ ok: false, skipped: "prefs_columns" }), { headers: corsHeaders });
         const userId = auth.userId;
         const body = await request.json().catch(() => ({}));
-        const color = pickUiPref(body?.color, UI_PREF_ALLOWED.color);
-        const theme = pickUiPref(body?.theme, UI_PREF_ALLOWED.theme);
-        const lang = pickUiPref(body?.lang, UI_PREF_ALLOWED.lang);
-        const font = pickUiPref(body?.font, UI_PREF_ALLOWED.font);
-        if (!color && !theme && !lang && !font) {
-          const current = await fetchUserById(userId);
-          return new Response(JSON.stringify(current || { ok: true }), { headers: corsHeaders });
-        }
+        const incoming = normalizeUiPrefs(body) || {};
+        const prev = (await readUiPrefs(env, userId)) || normalizeUiPrefs(await fetchUserById(userId)) || {};
+        const prefs = {
+          color: incoming.color || prev.color || "default",
+          theme: incoming.theme || prev.theme || "default",
+          lang: incoming.lang || prev.lang || "en",
+          font: incoming.font || prev.font || "md",
+        };
+
         try {
-          const data = await neonQuery(
-            `UPDATE users SET
-               ui_color = COALESCE($2, ui_color),
-               ui_theme = COALESCE($3, ui_theme),
-               ui_lang = COALESCE($4, ui_lang),
-               ui_font = COALESCE($5, ui_font)
-             WHERE id = $1
-             RETURNING *`,
-            [userId, color, theme, lang, font]
-          );
-          return new Response(JSON.stringify(data.rows[0] || { ok: true }), { headers: corsHeaders });
+          await writeUiPrefs(env, userId, prefs);
         } catch (err) {
-          console.warn("[prefs] save-prefs failed:", err);
-          return new Response(JSON.stringify({ ok: false, skipped: "prefs_update" }), { headers: corsHeaders });
+          console.error("[prefs] kv write failed:", err);
+          return new Response(JSON.stringify({ error: "Failed to save prefs", ok: false }), { status: 500, headers: corsHeaders });
         }
+
+        if (await ensureUiPrefsColumns()) {
+          try {
+            await neonQuery(
+              `UPDATE users SET
+                 ui_color = $2,
+                 ui_theme = $3,
+                 ui_lang = $4,
+                 ui_font = $5
+               WHERE id = $1`,
+              [userId, prefs.color, prefs.theme, prefs.lang, prefs.font]
+            );
+          } catch (err) {
+            console.warn("[prefs] column update skipped:", err);
+          }
+        }
+
+        return new Response(JSON.stringify({ ok: true, ...prefsToUserFields(prefs) }), { headers: corsHeaders });
       }
 
       if (url.pathname === "/increment-usage" && request.method === "POST") {
@@ -1226,7 +1288,14 @@ export default {
         const query = `SELECT messages FROM chats WHERE user_id = $1 ORDER BY updated_at DESC;`;
         const data = await neonQuery(query, [userId]);
 
-        const chats = data.rows.map((row) => typeof row.messages === "string" ? JSON.parse(row.messages) : row.messages);
+        const chats = [];
+        for (const row of data.rows || []) {
+          try {
+            const raw = row.messages;
+            const chat = typeof raw === "string" ? JSON.parse(raw) : raw;
+            if (chat && chat.id) chats.push(chat);
+          } catch (_) {}
+        }
         return new Response(JSON.stringify({ chats }), { headers: corsHeaders });
       }
 

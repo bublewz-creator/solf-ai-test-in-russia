@@ -193,7 +193,11 @@ module.exports.handler = async function (event, context) {
           images_count BIGINT DEFAULT 0,
           images_window_start BIGINT DEFAULT 0,
           quiz_count BIGINT DEFAULT 0,
-          quiz_window_start BIGINT DEFAULT 0
+          quiz_window_start BIGINT DEFAULT 0,
+          ui_color TEXT,
+          ui_theme TEXT,
+          ui_lang TEXT,
+          ui_font TEXT
         )
       `);
       await neonQuery(`
@@ -403,6 +407,66 @@ module.exports.handler = async function (event, context) {
 
   function pickUiPref(value, allowed) {
     return allowed.has(value) ? value : null;
+  }
+
+  function uiPrefsKey(userId) {
+    return "ui_prefs:" + userId;
+  }
+
+  function normalizeUiPrefs(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const color = pickUiPref(raw.color || raw.ui_color, UI_PREF_ALLOWED.color);
+    const theme = pickUiPref(raw.theme || raw.ui_theme, UI_PREF_ALLOWED.theme);
+    const lang = pickUiPref(raw.lang || raw.ui_lang, UI_PREF_ALLOWED.lang);
+    const font = pickUiPref(raw.font || raw.ui_font, UI_PREF_ALLOWED.font);
+    if (!color && !theme && !lang && !font) return null;
+    return { color, theme, lang, font };
+  }
+
+  function parseUiPrefsValue(raw) {
+    if (!raw) return null;
+    try {
+      return normalizeUiPrefs(typeof raw === "string" ? JSON.parse(raw) : raw);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  async function readUiPrefs(userId) {
+    if (!userId) return null;
+    try {
+      return parseUiPrefsValue(await kv.get(uiPrefsKey(userId)));
+    } catch (err) {
+      console.warn("[prefs] kv read failed:", err && err.message);
+      return null;
+    }
+  }
+
+  async function writeUiPrefs(userId, prefs) {
+    await kv.put(uiPrefsKey(userId), JSON.stringify({
+      color: prefs.color || null,
+      theme: prefs.theme || null,
+      lang: prefs.lang || null,
+      font: prefs.font || null,
+    }));
+  }
+
+  function prefsToUserFields(prefs) {
+    return {
+      ui_color: (prefs && prefs.color) || null,
+      ui_theme: (prefs && prefs.theme) || null,
+      ui_lang: (prefs && prefs.lang) || null,
+      ui_font: (prefs && prefs.font) || null,
+    };
+  }
+
+  async function attachUiPrefs(user) {
+    if (!user || !user.id) return user;
+    const fromKv = await readUiPrefs(user.id);
+    const fromCols = normalizeUiPrefs(user);
+    const prefs = fromKv || fromCols;
+    if (!prefs) return user;
+    return { ...user, ...prefsToUserFields(prefs) };
   }
 
   let uiPrefsReady = false;
@@ -894,7 +958,7 @@ module.exports.handler = async function (event, context) {
         });
       }
 
-      return jsonResponse(200, { user: dbUser || profile, sessionToken });
+      return jsonResponse(200, { user: await attachUiPrefs(dbUser || profile), sessionToken });
     } catch (err) {
       console.error("[auth/google]", err);
       return jsonResponse(500, {
@@ -960,7 +1024,7 @@ module.exports.handler = async function (event, context) {
       };
       const dbUser = await upsertOAuthUser(profile);
       const sessionToken = await createSession(profile.id);
-      return jsonResponse(200, { user: dbUser || profile, sessionToken });
+      return jsonResponse(200, { user: await attachUiPrefs(dbUser || profile), sessionToken });
     } catch (err) {
       console.error("[auth/vk]", err);
       return jsonResponse(500, { error: err.message || "VK auth failed" });
@@ -1212,7 +1276,7 @@ module.exports.handler = async function (event, context) {
     const sessionToken = await createSession(user.id);
     const dbUser = await getUserWithFreshUsage(user.id);
 
-    return jsonResponse(200, { ok: true, user: dbUser || user, sessionToken });
+    return jsonResponse(200, { ok: true, user: await attachUiPrefs(dbUser || user), sessionToken });
   }
 
     const body = (httpMethod === "POST" || httpMethod === "PUT" || httpMethod === "PATCH")
@@ -1222,7 +1286,7 @@ module.exports.handler = async function (event, context) {
     if (httpMethod === "GET" && pathname === "/health") {
       const info = {
         ok: true,
-        build: "2026-08-16-ycpg1",
+        build: "2026-08-17-prefs1",
         generateProvider: "deepseek",
         deepseekModel: process.env.DEEPSEEK_MODEL || "deepseek-v4-flash",
         hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
@@ -1336,7 +1400,7 @@ module.exports.handler = async function (event, context) {
 
       // Важно: refillUsageOnPlanUpgrade здесь НЕ вызываем.
       // Refill только в /update-plan.
-      const user = await getUserWithFreshUsage(userId);
+      const user = await attachUiPrefs(await getUserWithFreshUsage(userId));
       if (!user) return jsonResponse(404, { error: "Not found" });
 
       return jsonResponse(200, user);
@@ -1383,7 +1447,7 @@ module.exports.handler = async function (event, context) {
         RETURNING *;
       `;
       const data = await neonQuery(queryText, [user.id, user.email, user.name, user.picture]);
-      const fresh = await getUserWithFreshUsage(user.id);
+      const fresh = await attachUiPrefs(await getUserWithFreshUsage(user.id));
       return jsonResponse(200, fresh || data.rows[0]);
     }
 
@@ -1391,34 +1455,40 @@ module.exports.handler = async function (event, context) {
       const auth = await requireAuth();
       if (auth.error) return auth.error;
 
-      const colsOk = await ensureUiPrefsColumns();
-      if (!colsOk) return jsonResponse(200, { ok: false, skipped: "prefs_columns" });
       const userId = auth.userId;
-      const color = pickUiPref(body?.color, UI_PREF_ALLOWED.color);
-      const theme = pickUiPref(body?.theme, UI_PREF_ALLOWED.theme);
-      const lang = pickUiPref(body?.lang, UI_PREF_ALLOWED.lang);
-      const font = pickUiPref(body?.font, UI_PREF_ALLOWED.font);
-      if (!color && !theme && !lang && !font) {
-        const current = await fetchUserById(userId);
-        return jsonResponse(200, current || { ok: true });
-      }
+      const incoming = normalizeUiPrefs(body) || {};
+      const prev = (await readUiPrefs(userId)) || normalizeUiPrefs(await fetchUserById(userId)) || {};
+      const prefs = {
+        color: incoming.color || prev.color || "default",
+        theme: incoming.theme || prev.theme || "default",
+        lang: incoming.lang || prev.lang || "en",
+        font: incoming.font || prev.font || "md",
+      };
 
       try {
-        const data = await neonQuery(
-          `UPDATE users SET
-             ui_color = COALESCE($2, ui_color),
-             ui_theme = COALESCE($3, ui_theme),
-             ui_lang = COALESCE($4, ui_lang),
-             ui_font = COALESCE($5, ui_font)
-           WHERE id = $1
-           RETURNING *`,
-          [userId, color, theme, lang, font]
-        );
-        return jsonResponse(200, data.rows[0] || { ok: true });
+        await writeUiPrefs(userId, prefs);
       } catch (err) {
-        console.warn("[prefs] save-prefs failed:", err && err.message);
-        return jsonResponse(200, { ok: false, skipped: "prefs_update" });
+        console.error("[prefs] kv write failed:", err && err.message);
+        return jsonResponse(500, { error: "Failed to save prefs", ok: false });
       }
+
+      if (await ensureUiPrefsColumns()) {
+        try {
+          await neonQuery(
+            `UPDATE users SET
+               ui_color = $2,
+               ui_theme = $3,
+               ui_lang = $4,
+               ui_font = $5
+             WHERE id = $1`,
+            [userId, prefs.color, prefs.theme, prefs.lang, prefs.font]
+          );
+        } catch (err) {
+          console.warn("[prefs] column update skipped:", err && err.message);
+        }
+      }
+
+      return jsonResponse(200, { ok: true, ...prefsToUserFields(prefs) });
     }
 
     if (pathname === "/increment-usage" && httpMethod === "POST") {
@@ -1648,7 +1718,14 @@ module.exports.handler = async function (event, context) {
       const queryText = `SELECT messages FROM chats WHERE user_id = $1 ORDER BY updated_at DESC;`;
       const data = await neonQuery(queryText, [userId]);
 
-      const chats = data.rows.map((row) => typeof row.messages === "string" ? JSON.parse(row.messages) : row.messages);
+      const chats = [];
+      for (const row of data.rows || []) {
+        try {
+          const raw = row.messages;
+          const chat = typeof raw === "string" ? JSON.parse(raw) : raw;
+          if (chat && chat.id) chats.push(chat);
+        } catch (_) {}
+      }
       return jsonResponse(200, { chats });
     }
 
