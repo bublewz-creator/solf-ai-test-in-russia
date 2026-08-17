@@ -180,27 +180,28 @@
             text-align: center;
         }
         .empty-chat-state h1 {
-            font-family: 'Ephesis', 'Outfit', cursive;
-            font-size: 6.25rem;
-            font-weight: 400;
-            letter-spacing: 0.08em;
-            line-height: 1;
             margin: 0;
-            padding: 0.18em 0.28em 0.02em;
+            padding: 0.12em 0.2em 0.08em;
+            font-size: 5.75rem;
+            font-weight: 400;
+            line-height: 1.15;
+            letter-spacing: 0;
             color: var(--text-primary);
-            -webkit-text-stroke: 0.7px currentColor;
-            paint-order: stroke fill;
-            filter: drop-shadow(0 10px 28px var(--glow-color));
+        }
+        .empty-chat-state h1 span {
+            font-family: 'Ephesis', 'Outfit', cursive;
+            font-weight: 400;
+            font-size: inherit;
+            letter-spacing: 0.02em;
+            line-height: inherit;
         }
         .empty-chat-state h1 .logo-dot {
             color: var(--purple-soft);
-            -webkit-text-stroke-color: var(--purple-soft);
         }
         .empty-chat-state .chat-subtitle {
-            margin-top: 0;
+            margin-top: 2px;
             font-size: 1.05rem;
             font-weight: 400;
-            letter-spacing: 0.01em;
         }
         
         .chat-input-container {
@@ -417,7 +418,7 @@
             <div class="chat-messages" id="chatMessages"></div>
             
            <div class="empty-chat-state" id="emptyChatState">
-                <h1 class="main-title">Solf<span class="logo-dot">-ai</span></h1>
+                <h1 class="main-title"><span>Solf</span><span class="logo-dot">-ai</span></h1>
                 <p class="chat-subtitle" data-i18n="heroSubtitle">How can I help?</p>
             </div>
 
