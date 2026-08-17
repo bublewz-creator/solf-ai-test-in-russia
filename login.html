@@ -21,7 +21,7 @@
     <link rel="apple-touch-icon" sizes="180x180" href="assets/apple-touch-icon.png?v=8">
     <link rel="manifest" href="manifest.json">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css?v=10">
+    <link rel="stylesheet" href="styles.css">
     <style>
         .login-page {
             min-height: 100dvh;
@@ -76,13 +76,10 @@
             box-shadow: var(--shadow-soft);
         }
         .login-logo {
-            display: flex;
-            justify-content: center;
-            margin-bottom: 4px;
-            min-height: 72px;
-        }
-        .login-logo .solf-hello-svg--inline {
-            max-width: 280px;
+            font-family: 'Outfit', system-ui, sans-serif;
+            font-size: 2.25rem;
+            font-weight: 800;
+            margin-bottom: 8px;
         }
         .login-subtitle {
             color: var(--text-secondary);
@@ -300,7 +297,7 @@
             </button>
 
             <div class="login-card">
-                <div class="login-logo" id="loginLogo" aria-label="Solf.ai"></div>
+                <div class="login-logo">Solf<span class="logo-dot">.ai</span></div>
                 <p class="login-subtitle">Sign in to save your chat history</p>
 
                 <label class="terms-row" for="termsAccept">
@@ -342,11 +339,7 @@
         </div>
     </div>
 
-    <script src="hello.js?v=1"></script>
     <script src="auth.js?v=3"></script>
     <script src="login.js?v=22"></script>
-    <script>
-        try { if (window.SolfHello) window.SolfHello.mountInline(document.getElementById('loginLogo')); } catch (_) {}
-    </script>
 </body>
 </html>

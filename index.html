@@ -123,7 +123,7 @@
          в app.js). Это убирает accounts.google.com из критического пути загрузки — у части
          пользователей без VPN запрос подвисает на несколько секунд и тормозит весь UI. -->
     
-    <link rel="stylesheet" href="styles.css?v=10">
+    <link rel="stylesheet" href="styles.css?v=9">
 
     <style>
         /* Auth-dependent visibility — classes set synchronously in <head>, no FOUC */
@@ -266,13 +266,10 @@
     </style>
 </head>
 <body class="preload">
-    <script src="hello.js?v=1"></script>
     <script>
-        try { if (window.SolfHello) window.SolfHello.mountSplash(); } catch (_) {}
         /* Fallback: if app.js fails to load, still reveal UI after 4s (body.preload = opacity 0). */
         setTimeout(function () {
             try {
-                if (document.documentElement.classList.contains('hello-playing')) return;
                 document.body.classList.remove('preload', 'no-transition');
                 document.body.classList.add('app-ready');
             } catch (_) {}
