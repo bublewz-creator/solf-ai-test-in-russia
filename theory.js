@@ -4056,7 +4056,7 @@ In the **natural** form there is one tritone pair (A4 + d5); in the **harmonic**
         try {
             return window.SolfKB.getPrompt(query) || '';
         } catch (err) {
-            console.warn('[Solf.ai] Knowledge base unavailable:', err);
+            console.warn('[Solf-ai] Knowledge base unavailable:', err);
             return '';
         }
     }

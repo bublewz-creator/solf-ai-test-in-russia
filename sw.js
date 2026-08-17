@@ -1,5 +1,5 @@
 /*
- * Solf.ai — Service Worker "kill-switch".
+ * Solf-ai — Service Worker "kill-switch".
  *
  * ЗАЧЕМ ОН ВООБЩЕ НУЖЕН:
  *   У некоторых пользователей в браузере остался ЗАЛИПШИЙ Service Worker от прошлой

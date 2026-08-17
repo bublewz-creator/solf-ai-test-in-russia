@@ -1,4 +1,4 @@
-// Shared session helpers for Solf.ai API (Yandex Cloud Functions)
+// Shared session helpers for Solf-ai API (Yandex Cloud Functions)
 const SOLF_SESSION_KEY = 'solfai_session';
 
 function getSolfSessionToken() {

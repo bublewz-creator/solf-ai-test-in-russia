@@ -3,7 +3,7 @@
 const WORKER_URL = 'https://functions.yandexcloud.net/d4e2k40l9pmi9221vs4j';
 const GOOGLE_CLIENT_ID = '691304539168-iaouqdnkd73iprkcs6cou2i93t11qiak.apps.googleusercontent.com';
 const VK_APP_ID = 54641545;
-const VK_REDIRECT_URL = 'https://bublewz-creator.github.io/Solf-ai/';
+const VK_REDIRECT_URL = 'https://bublewz-creator.github.io/Solf.ai/';
 const VKID_SDK_URL = 'https://unpkg.com/@vkid/sdk@2.5.2/dist-sdk/umd/index.js';
 
 let termsAccepted = false;
@@ -132,7 +132,7 @@ function initGoogleAuth() {
             }
             persistConsents();
             exchangeGoogleCredential(r.credential).catch((err) => {
-                console.warn('[Solf.ai] Google auth error:', err);
+                console.warn('[Solf-ai] Google auth error:', err);
                 alert('Sign-in failed: ' + (err.message || 'Unknown error'));
             });
         }
@@ -159,10 +159,10 @@ function ensureGoogleSignInLoaded() {
     s.src = 'https://accounts.google.com/gsi/client';
     s.async = true;
     s.defer = true;
-    s.onload = () => { try { initGoogleAuth(); } catch (e) { console.warn('[Solf.ai] Google init error:', e); } };
+    s.onload = () => { try { initGoogleAuth(); } catch (e) { console.warn('[Solf-ai] Google init error:', e); } };
     s.onerror = () => {
         window.__solfGsiLoading = false;
-        console.warn('[Solf.ai] Google Sign-In unavailable.');
+        console.warn('[Solf-ai] Google Sign-In unavailable.');
     };
     document.head.appendChild(s);
 }
@@ -190,12 +190,12 @@ function ensureVkIdLoaded() {
         s.src = VKID_SDK_URL;
         s.async = true;
         s.onload = () => {
-            try { initVkIdAuth(); } catch (e) { console.warn('[Solf.ai] VK init error:', e); }
+            try { initVkIdAuth(); } catch (e) { console.warn('[Solf-ai] VK init error:', e); }
             resolve(window.VKIDSDK || null);
         };
         s.onerror = () => {
             window.__solfVkIdLoading = false;
-            console.warn('[Solf.ai] VK ID SDK unavailable.');
+            console.warn('[Solf-ai] VK ID SDK unavailable.');
             resolve(null);
         };
         document.head.appendChild(s);
@@ -213,7 +213,7 @@ async function handleVkIdAuthSuccess(data) {
             access_token: data.access_token,
         });
     } catch (err) {
-        console.warn('[Solf.ai] VK auth error:', err);
+        console.warn('[Solf-ai] VK auth error:', err);
         alert('Sign-in failed: ' + (err.message || 'Unknown error'));
     }
 }
@@ -247,7 +247,7 @@ async function startVkLogin(e) {
         });
         await exchangeVkCode(result);
     } catch (err) {
-        console.warn('[Solf.ai] VK auth error:', err);
+        console.warn('[Solf-ai] VK auth error:', err);
         alert('VK sign-in failed: ' + (err?.message || err || 'Unknown error'));
     }
 }
@@ -281,7 +281,7 @@ function initVkIdAuth() {
         });
         vkConfigReady = true;
     } catch (e) {
-        console.warn('[Solf.ai] VK ID init failed:', e);
+        console.warn('[Solf-ai] VK ID init failed:', e);
     }
     bindAuthCircleClicks();
 }
@@ -300,7 +300,7 @@ async function completeVkRedirectIfNeeded() {
         initVkIdAuth();
         await exchangeVkCode({ code, device_id: deviceId });
     } catch (err) {
-        console.warn('[Solf.ai] VK redirect auth error:', err);
+        console.warn('[Solf-ai] VK redirect auth error:', err);
         alert('VK sign-in failed: ' + (err?.message || err));
     }
 }

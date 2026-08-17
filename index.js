@@ -1,15 +1,43 @@
 // ============================================================================
-// Solf.ai — Yandex Cloud Functions (API + NeonDB Gateway)
+// Solf-ai — Yandex Cloud Functions (API + PostgreSQL)
 // ============================================================================
-// Адаптация Cloudflare Worker (worker.js) под формат Yandex Cloud Functions:
 //   - module.exports.handler(event, context)
-//   - process.env вместо env bindings
-//   - ответы { statusCode, headers, body }
-//   - /generate → DeepSeek API (deepseek-v4-flash)
-//   - сессии/OTP: NeonDB kv_store вместо Cloudflare KV
+//   - DATABASE_URL → обычный PostgreSQL (Yandex MDB / любой postgres://)
+//   - /generate → DeepSeek
+//   - сессии/OTP: kv_store
 // ============================================================================
 
 const crypto = require("crypto");
+const { Pool } = require("pg");
+
+let pgPool = null;
+let pgPoolUrl = null;
+
+function getPgPool() {
+  const databaseUrl = String(process.env.DATABASE_URL || "").trim();
+  if (!databaseUrl) throw new Error("DATABASE_URL is missing in environment variables");
+  if (!pgPool || pgPoolUrl !== databaseUrl) {
+    if (pgPool) pgPool.end().catch(() => {});
+    // sslmode=require в URL у Node часто требует проверку CA и падает на цепочке Яндекса.
+    // SSL включаем сами, без проверки самоподписанного CA.
+    let connectionString = databaseUrl;
+    try {
+      const u = new URL(databaseUrl);
+      u.searchParams.delete("sslmode");
+      u.searchParams.delete("ssl");
+      connectionString = u.toString();
+    } catch (_) {}
+    pgPool = new Pool({
+      connectionString,
+      ssl: { rejectUnauthorized: false },
+      max: 2,
+      idleTimeoutMillis: 5000,
+      connectionTimeoutMillis: 15000,
+    });
+    pgPoolUrl = databaseUrl;
+  }
+  return pgPool;
+}
 
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
@@ -137,101 +165,56 @@ module.exports.handler = async function (event, context) {
     }
 
     if (httpMethod === "GET" && (pathname === "/" || pathname === "")) {
-      return jsonResponse(200, { status: "Solf.ai API & NeonDB Gateway is running" });
+      return jsonResponse(200, { status: "Solf-ai API is running" });
     }
 
   async function neonQuery(queryText, params = []) {
-    if (!process.env.DATABASE_URL) {
-      throw new Error("DATABASE_URL is missing in environment variables");
-    }
-
-    let dbUrl;
-    try {
-      dbUrl = new URL(process.env.DATABASE_URL);
-    } catch (_) {
-      throw new Error("DATABASE_URL is not a valid URL");
-    }
-    const host = dbUrl.hostname;
-    if (!host) throw new Error("DATABASE_URL has empty hostname");
-
-    const response = await fetch(`https://${host}/sql`, {
-      method: "POST",
-      headers: {
-        "Neon-Connection-String": process.env.DATABASE_URL,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ query: queryText, params }),
-    });
-
-    const rawText = await response.text();
-    let data = null;
-    try {
-      data = rawText ? JSON.parse(rawText) : null;
-    } catch (_) {
-      data = null;
-    }
-
-    if (!response.ok) {
-      console.error("Neon DB Error:", rawText);
-      throw new Error(
-        `Database query failed (${response.status}): ${(rawText || "").slice(0, 400)}`
-      );
-    }
-
-    // Neon иногда отдаёт 200 с ошибкой в теле
-    if (data && (data.message || data.error || data.code === "XX000")) {
-      const msg = data.message || data.error?.message || JSON.stringify(data.error || data);
-      // Не считаем ошибкой обычный успешный payload с message-полем в rows
-      if (!Array.isArray(data.rows) && !Array.isArray(data.fields)) {
-        console.error("Neon DB logical error:", data);
-        throw new Error(`Neon: ${String(msg).slice(0, 400)}`);
-      }
-    }
-
-    if (!data || typeof data !== "object") {
-      throw new Error("Neon returned empty/invalid JSON");
-    }
-
-    // Нормализуем rows, если драйвер вернул массив массивов
-    if (Array.isArray(data.rows) && data.fields && data.rows.length && Array.isArray(data.rows[0])) {
-      data.rows = data.rows.map((arr) => {
-        const obj = {};
-        data.fields.forEach((f, i) => {
-          const name = f.columnID != null ? f.name : (f.name || f.columnName || `c${i}`);
-          obj[name] = arr[i];
-        });
-        return obj;
-      });
-    }
-
-    return data;
+    const result = await getPgPool().query(queryText, params);
+    return { rows: result.rows, fields: result.fields, rowCount: result.rowCount };
   }
 
-  // ========== Neon-backed KV (замена Cloudflare KV для сессий / OTP) ==========
-  let kvReady = false;
-  let kvInitError = null;
+  // Таблицы сами создаются на пустой БД
+  let schemaReady = false;
+  let schemaInitError = null;
 
   async function ensureKvTable() {
-    if (kvReady) return;
-    if (kvInitError) throw kvInitError;
+    if (schemaReady) return;
+    if (schemaInitError) throw schemaInitError;
     try {
-      await neonQuery(
-        `CREATE TABLE IF NOT EXISTS kv_store (
+      await neonQuery(`
+        CREATE TABLE IF NOT EXISTS users (
+          id TEXT PRIMARY KEY,
+          email TEXT,
+          name TEXT,
+          picture TEXT,
+          plan_type TEXT DEFAULT 'free',
+          requests_count BIGINT DEFAULT 0,
+          requests_window_start BIGINT DEFAULT 0,
+          images_count BIGINT DEFAULT 0,
+          images_window_start BIGINT DEFAULT 0,
+          quiz_count BIGINT DEFAULT 0,
+          quiz_window_start BIGINT DEFAULT 0
+        )
+      `);
+      await neonQuery(`
+        CREATE TABLE IF NOT EXISTS chats (
+          id TEXT PRIMARY KEY,
+          user_id TEXT NOT NULL,
+          title TEXT,
+          messages JSONB,
+          updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+      await neonQuery(`
+        CREATE TABLE IF NOT EXISTS kv_store (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL,
           expires_at TEXT
-        )`
-      );
-      // На старых деплоях expires_at мог стать timestamp/bigint — приводим к TEXT
-      try {
-        await neonQuery(
-          `ALTER TABLE kv_store
-           ALTER COLUMN expires_at TYPE TEXT USING expires_at::text`
-        );
-      } catch (_) {}
-      kvReady = true;
+        )
+      `);
+      schemaReady = true;
     } catch (err) {
-      kvInitError = err;
+      schemaInitError = err;
       throw err;
     }
   }
@@ -1045,7 +1028,7 @@ module.exports.handler = async function (event, context) {
       body: JSON.stringify({
         from: process.env.OTP_FROM_EMAIL,
         to: [to],
-        subject: "Your Solf.ai sign-in code",
+        subject: "Your Solf-ai sign-in code",
         html: `<p>Your verification code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p><p>This code expires in 10 minutes.</p>`,
       }),
     });
@@ -1071,7 +1054,7 @@ module.exports.handler = async function (event, context) {
         body: new URLSearchParams({
           To: "+" + phoneDigits,
           From: process.env.TWILIO_FROM_NUMBER,
-          Body: `Your Solf.ai code: ${code}. Valid for 10 minutes.`,
+          Body: `Your Solf-ai code: ${code}. Valid for 10 minutes.`,
         }),
       }
     );
@@ -1212,7 +1195,7 @@ module.exports.handler = async function (event, context) {
     if (httpMethod === "GET" && pathname === "/health") {
       const info = {
         ok: true,
-        build: "2026-08-15-ds3",
+        build: "2026-08-16-ycpg1",
         generateProvider: "deepseek",
         deepseekModel: process.env.DEEPSEEK_MODEL || "deepseek-v4-flash",
         hasDatabaseUrl: Boolean(process.env.DATABASE_URL),

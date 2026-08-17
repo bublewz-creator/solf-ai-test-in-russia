@@ -1,4 +1,4 @@
-/* ===== SOLF.AI STYLES ===== */
+/* ===== SOLF-AI STYLES ===== */
 /* Font-stack специально длинный: если Google Fonts заблокированы провайдером
    (актуально для части пользователей РФ без VPN — fonts.googleapis.com периодически
    режется), используется ближайший системный шрифт ОС, и интерфейс не "плывёт". */
@@ -858,7 +858,7 @@ button:focus:not(:focus-visible) {
     .quiz-options { grid-template-columns: 1fr; gap: 10px; }
     .toast-container { top: 20px; bottom: auto; left: 10px; right: 10px; transform: none; }
     
-    .empty-chat-state h1 { font-size: 3.5rem; }
+    .empty-chat-state h1 { font-size: 4.4rem; }
     .chat-subtitle { font-size: 0.95rem; }
 }
 

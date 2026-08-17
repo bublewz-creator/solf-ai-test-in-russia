@@ -1,5 +1,5 @@
 // ============================================================================
-// Solf.ai — Cloudflare Worker (API + NeonDB Gateway)
+// Solf-ai — Cloudflare Worker (API + NeonDB Gateway)
 // ============================================================================
 // ВАЖНОЕ ИЗМЕНЕНИЕ vs старая версия:
 //   /generate теперь УВАЖАЕТ maxOutputTokens, который присылает фронтенд
@@ -27,7 +27,7 @@ export default {
     const url = new URL(request.url);
 
     if (request.method === "GET" && url.pathname === "/") {
-      return new Response(JSON.stringify({ status: "Solf.ai API & NeonDB Gateway is running" }), { headers: corsHeaders });
+      return new Response(JSON.stringify({ status: "Solf-ai API & NeonDB Gateway is running" }), { headers: corsHeaders });
     }
 
     async function neonQuery(query, params = []) {
@@ -751,7 +751,7 @@ export default {
         body: JSON.stringify({
           from: env.OTP_FROM_EMAIL,
           to: [to],
-          subject: "Your Solf.ai sign-in code",
+          subject: "Your Solf-ai sign-in code",
           html: `<p>Your verification code is:</p><p style="font-size:28px;font-weight:700;letter-spacing:4px">${code}</p><p>This code expires in 10 minutes.</p>`,
         }),
       });
@@ -777,7 +777,7 @@ export default {
           body: new URLSearchParams({
             To: "+" + phoneDigits,
             From: env.TWILIO_FROM_NUMBER,
-            Body: `Your Solf.ai code: ${code}. Valid for 10 minutes.`,
+            Body: `Your Solf-ai code: ${code}. Valid for 10 minutes.`,
           }),
         }
       );

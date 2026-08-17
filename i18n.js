@@ -46,7 +46,7 @@ const translations = {
         continue: 'Continue',
         later: 'Later',
         guest: 'Guest',
-        heroSubtitle: 'Your personal AI solfeggio assistant.',
+        heroSubtitle: 'How can I help?',
         askAnything: 'Ask about solfeggio...',
         askSolfeggio: 'Ask about solfeggio...',
         newChat: 'New Chat',
@@ -56,7 +56,7 @@ const translations = {
         support: 'Support',
         upgrade: 'Upgrade',
         home: 'Home',
-        disclaimer: 'Solf.ai may make mistakes. Please verify important information. · <a href="privacy.html">Privacy</a> · <a href="terms.html">Terms</a>',
+        disclaimer: 'Solf-ai may make mistakes. Please verify important information. · <a href="privacy.html">Privacy</a> · <a href="terms.html">Terms</a>',
         
         // --- TOUR & INSTRUCTIONS ---
         tourSkip: 'Skip',
@@ -79,7 +79,7 @@ const translations = {
         feature1Desc: 'Learn to build any chords — from simple triads to complex jazz voicings. Inversions, functions, and voice leading explained in simple terms.',
         feature1Tag: 'For Pianists',
         feature2Title: 'Ear Training',
-        feature2Desc: 'Develop your musical ear. Solf.ai generates melodies, intervals, and chords for dictations and helps you check them.',
+        feature2Desc: 'Develop your musical ear. Solf-ai generates melodies, intervals, and chords for dictations and helps you check them.',
         feature2Tag: 'For All Levels',
         feature3Title: 'Scales & Modes',
         feature3Desc: 'Explore all types of scales. Major, minor, pentatonic, church modes — visualize them on a keyboard and learn how to use them.',
@@ -186,7 +186,7 @@ const translations = {
         continue: 'Продолжить',
         later: 'Позже',
         guest: 'Гость',
-        heroSubtitle: 'Твой личный ИИ-помощник по сольфеджио.',
+        heroSubtitle: 'Чем я могу помочь?',
         askAnything: 'Спроси о сольфеджио...',
         askSolfeggio: 'Спроси о сольфеджио...',
         newChat: 'Новый чат',
@@ -196,7 +196,7 @@ const translations = {
         support: 'Поддержка',
         upgrade: 'Улучшить',
         home: 'На главную',
-        disclaimer: 'Solf.ai может допускать ошибки. Пожалуйста, проверяйте важную информацию. · <a href="privacy.html">Политика</a> · <a href="terms.html">Условия</a>',
+        disclaimer: 'Solf-ai может допускать ошибки. Пожалуйста, проверяйте важную информацию. · <a href="privacy.html">Политика</a> · <a href="terms.html">Условия</a>',
         
         // --- TOUR & INSTRUCTIONS ---
         tourSkip: 'Пропустить',
@@ -219,7 +219,7 @@ const translations = {
         feature1Desc: 'Научись строить любые аккорды — от простых трезвучий до джазовых. Обращения и функции простым языком.',
         feature1Tag: 'Для пианистов',
         feature2Title: 'Тренировка слуха',
-        feature2Desc: 'Развивай музыкальный слух. Solf.ai генерирует мелодии, интервалы и аккорды для диктантов и помогает их проверять.',
+        feature2Desc: 'Развивай музыкальный слух. Solf-ai генерирует мелодии, интервалы и аккорды для диктантов и помогает их проверять.',
         feature2Tag: 'Для всех',
         feature3Title: 'Лады и Тональности',
         feature3Desc: 'Изучи все виды ладов. Мажор, минор, пентатоника, народные лады — визуализируй их на клавиатуре.',
@@ -326,7 +326,7 @@ const translations = {
         continue: 'Weiter',
         later: 'Später',
         guest: 'Gast',
-        heroSubtitle: 'Dein persönlicher KI-Solfeggio-Assistent.',
+        heroSubtitle: 'Womit kann ich helfen?',
         askAnything: 'Frag nach Solfeggio...',
         askSolfeggio: 'Frag nach Solfeggio...',
         newChat: 'Neuer Chat',
@@ -336,7 +336,7 @@ const translations = {
         support: 'Support',
         upgrade: 'Upgrade',
         home: 'Startseite',
-        disclaimer: 'Solf.ai kann Fehler machen. Bitte überprüfen Sie wichtige Informationen. · <a href="privacy.html">Datenschutz</a> · <a href="terms.html">AGB</a>',
+        disclaimer: 'Solf-ai kann Fehler machen. Bitte überprüfen Sie wichtige Informationen. · <a href="privacy.html">Datenschutz</a> · <a href="terms.html">AGB</a>',
         
         // --- TOUR & INSTRUCTIONS ---
         tourSkip: 'Überspringen',
@@ -359,7 +359,7 @@ const translations = {
         feature1Desc: 'Lerne jeden Akkord zu bauen — von einfachen Dreiklängen bis zu komplexen Jazz-Voicings.',
         feature1Tag: 'Für Pianisten',
         feature2Title: 'Gehörtraining',
-        feature2Desc: 'Entwickle dein musikalisches Gehör mit Solf.ai.',
+        feature2Desc: 'Entwickle dein musikalisches Gehör mit Solf-ai.',
         feature2Tag: 'Für Alle',
         feature3Title: 'Tonleitern & Modi',
         feature3Desc: 'Erkunde alle Arten von Tonleitern. Dur, Moll, Pentatonik, Kirchentonarten.',
@@ -463,7 +463,7 @@ const translations = {
         continue: 'Continuar',
         later: 'Más tarde',
         guest: 'Invitado',
-        heroSubtitle: 'Tu asistente personal de solfeo de IA.',
+        heroSubtitle: '¿En qué puedo ayudarte?',
         askAnything: 'Pregunta sobre solfeo...',
         askSolfeggio: 'Pregunta sobre solfeo...',
         newChat: 'Nuevo Chat',
@@ -473,7 +473,7 @@ const translations = {
         support: 'Soporte',
         upgrade: 'Mejorar',
         home: 'Inicio',
-        disclaimer: 'Solf.ai puede cometer errores. Por favor, verifica la información importante. · <a href="privacy.html">Privacidad</a> · <a href="terms.html">Términos</a>',
+        disclaimer: 'Solf-ai puede cometer errores. Por favor, verifica la información importante. · <a href="privacy.html">Privacidad</a> · <a href="terms.html">Términos</a>',
         
         // --- TOUR & INSTRUCTIONS ---
         tourSkip: 'Omitir',
@@ -496,7 +496,7 @@ const translations = {
         feature1Desc: 'Aprende a construir cualquier acorde, desde tríadas simples hasta jazz.',
         feature1Tag: 'Para Pianistas',
         feature2Title: 'Entrenamiento Auditivo',
-        feature2Desc: 'Desarrolla tu oído musical con Solf.ai.',
+        feature2Desc: 'Desarrolla tu oído musical con Solf-ai.',
         feature2Tag: 'Para Todos',
         feature3Title: 'Escalas y Modos',
         feature3Desc: 'Explora todos los tipos de escalas. Mayor, menor, pentatónica.',
@@ -600,7 +600,7 @@ const translations = {
         continue: '继续',
         later: '稍后',
         guest: '访客',
-        heroSubtitle: '您的个人AI视唱练耳助手。',
+        heroSubtitle: '我能帮你什么？',
         askAnything: '询问关于视唱练耳...',
         askSolfeggio: '询问关于视唱练耳...',
         newChat: '新聊天',
@@ -610,7 +610,7 @@ const translations = {
         support: '支持',
         upgrade: '升级',
         home: '首页',
-        disclaimer: 'Solf.ai 可能会犯错。请验证重要信息。 · <a href="privacy.html">隐私</a> · <a href="terms.html">条款</a>',
+        disclaimer: 'Solf-ai 可能会犯错。请验证重要信息。 · <a href="privacy.html">隐私</a> · <a href="terms.html">条款</a>',
         
         // --- TOUR & INSTRUCTIONS ---
         tourSkip: '跳过',
@@ -737,7 +737,7 @@ const translations = {
         continue: '続行',
         later: '後で',
         guest: 'ゲスト',
-        heroSubtitle: 'あなたのパーソナルAIソルフェージュアシスタント。',
+        heroSubtitle: '何かお手伝いしましょうか？',
         askAnything: 'ソルフェージュについて質問...',
         askSolfeggio: 'ソルフェージュについて質問...',
         newChat: '新しいチャット',
@@ -747,7 +747,7 @@ const translations = {
         support: 'サポート',
         upgrade: 'アップグレード',
         home: 'ホーム',
-        disclaimer: 'Solf.ai は間違いを犯す可能性があります。 · <a href="privacy.html">プライバシー</a> · <a href="terms.html">利用規約</a>',
+        disclaimer: 'Solf-ai は間違いを犯す可能性があります。 · <a href="privacy.html">プライバシー</a> · <a href="terms.html">利用規約</a>',
         
         // --- TOUR & INSTRUCTIONS ---
         tourSkip: 'スキップ',

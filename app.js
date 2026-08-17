@@ -111,15 +111,28 @@ async function apiFetch(url, options = {}, timeoutMs = 25000) {
     if (options.body && !headers['Content-Type']) {
         headers['Content-Type'] = 'application/json';
     }
-    const res = await fetchWithTimeout(url, { ...options, headers }, timeoutMs);
-    if (res.status === 401 && typeof clearSolfAuth === 'function') {
-        clearSolfAuth();
-        currentUser = null;
-        if (!/login\.html/i.test(window.location.pathname || '')) {
-            window.location.href = 'login.html';
+    const t0 = Date.now();
+    let path = String(url);
+    try { path = new URL(url).searchParams.get('path') || path; } catch (_) {}
+    try {
+        const res = await fetchWithTimeout(url, { ...options, headers }, timeoutMs);
+        // #region agent log
+        fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'A',location:'app.js:apiFetch',message:'apiFetch response',data:{path,status:res.status,ok:res.ok,timeoutMs,ms:Date.now()-t0,method:options.method||'GET',hasAuth:!!headers['X-Auth-Token']},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+        if (res.status === 401 && typeof clearSolfAuth === 'function') {
+            clearSolfAuth();
+            currentUser = null;
+            if (!/login\.html/i.test(window.location.pathname || '')) {
+                window.location.href = 'login.html';
+            }
         }
+        return res;
+    } catch (err) {
+        // #region agent log
+        fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'A',location:'app.js:apiFetch',message:'apiFetch throw',data:{path,name:err&&err.name,msg:String(err&&err.message||err),timeoutMs,ms:Date.now()-t0,method:options.method||'GET',aborted:(err&&err.name)==='AbortError'},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
+        throw err;
     }
-    return res;
 }
 
 async function syncAppData() {
@@ -266,7 +279,7 @@ function scheduleServerSync(reason = '') {
         syncAppData(),
         syncChatsFromServer(),
     ])
-        .catch(err => console.warn('[Solf.ai] scheduleServerSync failed:', reason, err))
+        .catch(err => console.warn('[Solf-ai] scheduleServerSync failed:', reason, err))
         .finally(() => { __serverSyncInflight = null; });
     return __serverSyncInflight;
 }
@@ -286,7 +299,7 @@ const USAGE_WINDOWS = {
 };
 
 // ===== СТРОГИЙ ПРОМПТ =====
-const SYSTEM_PROMPT = `You are Solf.ai, an AI assistant for music theory and solfeggio.
+const SYSTEM_PROMPT = `You are Solf-ai, an AI assistant for music theory and solfeggio.
 Your tasks: explain music theory in simple terms, analyze images with musical notes.
 CRITICAL INSTRUCTION: DO NOT mention the built-in site tools (Piano, Metronome, Quiz) in your regular answers! Only mention them IF the user explicitly asks how to practice or train their ear. Answer directly and concisely.
 IMPORTANT: ALWAYS answer in the SAME language the user is speaking. Never default to Russian when the user writes in English (or any other language).
@@ -935,7 +948,7 @@ function queryTheoryNotation(userQuery) {
     try {
         return window.SolfTheory.buildNotationForQuery(q) || null;
     } catch (err) {
-        console.warn('[Solf.ai] Theory lookup failed:', err);
+        console.warn('[Solf-ai] Theory lookup failed:', err);
         return null;
     }
 }
@@ -1002,7 +1015,7 @@ function queryTheoryQuickAnswer(userQuery) {
     try {
         return window.SolfTheory.buildTheoryQuickAnswer(q) || null;
     } catch (err) {
-        console.warn('[Solf.ai] Theory quick answer failed:', err);
+        console.warn('[Solf-ai] Theory quick answer failed:', err);
         return null;
     }
 }
@@ -1671,7 +1684,7 @@ function enforceChatLimit() {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ id: chat.id, user_id: currentUser.id })
-            }).catch(err => console.warn('[Solf.ai] Failed to delete trimmed chat:', err));
+            }).catch(err => console.warn('[Solf-ai] Failed to delete trimmed chat:', err));
         });
     }
     return true;
@@ -2128,7 +2141,7 @@ async function consumeUsageOnServer(type = 'request') {
             body: JSON.stringify({ id: currentUser.id, type }),
         }, 12000);
     } catch (netErr) {
-        console.warn('[Solf.ai] consumeUsageOnServer network error, defer to /generate:', netErr);
+        console.warn('[Solf-ai] consumeUsageOnServer network error, defer to /generate:', netErr);
         return null;
     }
     const data = await res.json().catch(() => ({}));
@@ -2152,7 +2165,7 @@ async function consumeUsageOnServer(type = 'request') {
         throw err;
     }
     // Worker ещё не задеплоен / SQL глюк / 403 Forbidden — не блокируем чат
-    console.warn('[Solf.ai] consumeUsageOnServer soft-fail', res.status, data);
+    console.warn('[Solf-ai] consumeUsageOnServer soft-fail', res.status, data);
     return null;
 }
 
@@ -2168,7 +2181,7 @@ async function refundUsageOnServer(type = 'request') {
         const data = await res.json().catch(() => ({}));
         if (res.ok) applyUsageFromServer(data);
     } catch (err) {
-        console.warn('[Solf.ai] usage refund failed:', err);
+        console.warn('[Solf-ai] usage refund failed:', err);
     }
 }
 
@@ -2495,7 +2508,7 @@ function formatMessage(text) {
             placeholders.push(data);
             return `\u0001SOLF_NOT_${idx}\u0001`;
         } catch (e) {
-            console.warn('[Solf.ai] Notation JSON parse failed:', e, json);
+            console.warn('[Solf-ai] Notation JSON parse failed:', e, json);
             return '';
         }
     });
@@ -3217,7 +3230,7 @@ function renderSatbNotationCard(container, data) {
             svg.querySelectorAll('text').forEach(el => el.setAttribute('fill', noteColor));
         }
     } catch (err) {
-        console.error('[Solf.ai] SATB VexFlow render error:', err);
+        console.error('[Solf-ai] SATB VexFlow render error:', err);
         container.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationRenderFailed', { chat: true, fallback: 'Could not render notation' })}: ${err.message || err}</div>`;
     }
 }
@@ -3421,7 +3434,7 @@ function renderNotationCard(container, data) {
             svg.querySelectorAll('text').forEach(el => el.setAttribute('fill', noteColor));
         }
     } catch (err) {
-        console.error('[Solf.ai] VexFlow render error:', err);
+        console.error('[Solf-ai] VexFlow render error:', err);
         container.innerHTML = `<div class="notation-error">⚠️ ${uiText('notationRenderFailed', { chat: true, fallback: 'Could not render notation' })}: ${err.message || err}</div>`;
     }
 }
@@ -3506,6 +3519,9 @@ function normalizeImagePayload(imageData) {
 
 async function generateResponse(query, imageData = null) {
     imageData = normalizeImagePayload(imageData);
+    // #region agent log
+    fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'E',location:'app.js:generateResponse:entry',message:'generate start',data:{qLen:String(query||'').length,hasImage:!!imageData,loggedIn:typeof isUserLoggedIn==='function'&&isUserLoggedIn(),remaining:typeof getRemainingRequests==='function'?getRemainingRequests():null,notation:!!(typeof notationModeEnabled!=='undefined'&&notationModeEnabled),alreadyGenerating:!!isGenerating,hasSession:!!(typeof getSolfSessionToken==='function'&&getSolfSessionToken())},timestamp:Date.now()})}).catch(()=>{});
+    // #endregion
     if (getRemainingRequests() <= 0) { showNoRequestsToast(); refreshSendButtonState(); return; }
     if (imageData && getRemainingImages() <= 0) { 
         refreshImageAttachVisibility();
@@ -3573,16 +3589,19 @@ async function generateResponse(query, imageData = null) {
             instantReplyText = patchAiWithTheory(baseUserContent, '') || null;
         }
     } catch (theoryErr) {
-        console.warn('[Solf.ai] instant theory path failed:', theoryErr);
+        console.warn('[Solf-ai] instant theory path failed:', theoryErr);
     }
 
     if (instantReplyText) {
+        // #region agent log
+        fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'B',location:'app.js:generateResponse:instant',message:'instant theory path',data:{textLen:String(instantReplyText).length,loggedIn:isUserLoggedIn()},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         // Локально сразу −1, в БД — fire-and-forget (атомарный increment на сервере)
         if (isUserLoggedIn()) {
             useRequest();
             if (imageData) useImage();
             consumeUsageOnServer(usageType).catch(err => {
-                console.warn('[Solf.ai] background usage charge failed:', err);
+                console.warn('[Solf-ai] background usage charge failed:', err);
             });
         } else {
             useRequest();
@@ -3691,6 +3710,10 @@ async function generateResponse(query, imageData = null) {
         };
 
         const requestTimeoutMs = imageData ? 90000 : 60000;
+        const payloadBytes = JSON.stringify(payload).length;
+        // #region agent log
+        fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'D',location:'app.js:generateResponse:beforeGenerate',message:'calling /generate',data:{payloadBytes,msgCount:(payload.messages||[]).length,tokenBudget,timeoutMs:requestTimeoutMs,usageChargedOnServer,hasImage:!!payload.image},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         const res = await apiFetch(workerApi('/generate'), { 
             method: 'POST', 
             headers: { 'Content-Type': 'application/json' }, 
@@ -3698,7 +3721,15 @@ async function generateResponse(query, imageData = null) {
             signal: currentAbortController.signal 
         }, requestTimeoutMs);
 
-        const data = await res.json();
+        let data = {};
+        try {
+            data = await res.json();
+        } catch (parseErr) {
+            // #region agent log
+            fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'C',location:'app.js:generateResponse:json',message:'generate JSON parse fail',data:{status:res.status,ct:res.headers.get('content-type'),name:parseErr&&parseErr.name,msg:String(parseErr&&parseErr.message||parseErr)},timestamp:Date.now()})}).catch(()=>{});
+            // #endregion
+            throw parseErr;
+        }
         if (!res.ok || data.error) {
             console.error('Server error:', data);
             if (data.usage) applyUsageFromServer(data.usage);
@@ -3796,7 +3827,7 @@ async function generateResponse(query, imageData = null) {
                 }
             } catch (retryErr) {
                 if (retryErr?.name !== 'AbortError') {
-                    console.warn('[Solf.ai] Notation auto-retry failed:', retryErr);
+                    console.warn('[Solf-ai] Notation auto-retry failed:', retryErr);
                 }
             }
         }
@@ -3836,7 +3867,7 @@ async function generateResponse(query, imageData = null) {
                 }
             } catch (harmErr) {
                 if (harmErr?.name !== 'AbortError') {
-                    console.warn('[Solf.ai] Harmonization auto-retry failed:', harmErr);
+                    console.warn('[Solf-ai] Harmonization auto-retry failed:', harmErr);
                 }
             }
         }
@@ -3873,7 +3904,7 @@ async function generateResponse(query, imageData = null) {
                 }
             } catch (chainErr) {
                 if (chainErr?.name !== 'AbortError') {
-                    console.warn('[Solf.ai] Chain auto-retry failed:', chainErr);
+                    console.warn('[Solf-ai] Chain auto-retry failed:', chainErr);
                 }
             }
         }
@@ -3892,6 +3923,9 @@ async function generateResponse(query, imageData = null) {
         await deliverAiReplyToChat(replyChatId, aiText, { withTyping: true });
         
     } catch (e) {
+        // #region agent log
+        fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'A',location:'app.js:generateResponse:catch',message:'generate catch',data:{name:e&&e.name,msg:String(e&&e.message||e),ms:Date.now()-(generationStartedAt||Date.now()),usageChargedOnServer,userAborted:!!userAbortedGeneration},timestamp:Date.now()})}).catch(()=>{});
+        // #endregion
         removeTypingIndicator(replyChatId);
         // Возврат попытки ТОЛЬКО при сбое ИИ / таймауте / ошибке.
         // Ручной стоп (userAbortedGeneration) — попытка сгорает, не возвращаем.
