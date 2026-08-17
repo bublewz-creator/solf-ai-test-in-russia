@@ -145,12 +145,18 @@ export default {
       return allowed.has(value) ? value : null;
     }
     async function ensureUiPrefsColumns() {
-      if (uiPrefsReady) return;
-      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_color TEXT`);
-      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_theme TEXT`);
-      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_lang TEXT`);
-      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_font TEXT`);
-      uiPrefsReady = true;
+      if (uiPrefsReady) return true;
+      try {
+        await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_color TEXT`);
+        await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_theme TEXT`);
+        await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_lang TEXT`);
+        await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_font TEXT`);
+        uiPrefsReady = true;
+        return true;
+      } catch (err) {
+        console.warn("[prefs] ui_* columns not ready:", err);
+        return false;
+      }
     }
 
     async function persistUsageWindows(user) {
@@ -952,8 +958,6 @@ export default {
         const forbid = forbidSelfOnly(auth.userId, userId);
         if (forbid) return forbid;
 
-        await ensureUiPrefsColumns();
-
         // Важно: refillUsageOnPlanUpgrade здесь НЕ вызываем.
         // Раньше клиент слал prev_plan (часто устаревший/free после очистки кэша),
         // и сервер ошибочно считал это апгрейдом → обнулял requests_count в БД
@@ -1012,7 +1016,8 @@ export default {
         const auth = await requireAuth(request, env);
         if (auth.error) return auth.error;
 
-        await ensureUiPrefsColumns();
+        const colsOk = await ensureUiPrefsColumns();
+        if (!colsOk) return new Response(JSON.stringify({ ok: false, skipped: "prefs_columns" }), { headers: corsHeaders });
         const userId = auth.userId;
         const body = await request.json().catch(() => ({}));
         const color = pickUiPref(body?.color, UI_PREF_ALLOWED.color);
@@ -1023,17 +1028,22 @@ export default {
           const current = await fetchUserById(userId);
           return new Response(JSON.stringify(current || { ok: true }), { headers: corsHeaders });
         }
-        const data = await neonQuery(
-          `UPDATE users SET
-             ui_color = COALESCE($2, ui_color),
-             ui_theme = COALESCE($3, ui_theme),
-             ui_lang = COALESCE($4, ui_lang),
-             ui_font = COALESCE($5, ui_font)
-           WHERE id = $1
-           RETURNING *`,
-          [userId, color, theme, lang, font]
-        );
-        return new Response(JSON.stringify(data.rows[0] || { ok: true }), { headers: corsHeaders });
+        try {
+          const data = await neonQuery(
+            `UPDATE users SET
+               ui_color = COALESCE($2, ui_color),
+               ui_theme = COALESCE($3, ui_theme),
+               ui_lang = COALESCE($4, ui_lang),
+               ui_font = COALESCE($5, ui_font)
+             WHERE id = $1
+             RETURNING *`,
+            [userId, color, theme, lang, font]
+          );
+          return new Response(JSON.stringify(data.rows[0] || { ok: true }), { headers: corsHeaders });
+        } catch (err) {
+          console.warn("[prefs] save-prefs failed:", err);
+          return new Response(JSON.stringify({ ok: false, skipped: "prefs_update" }), { headers: corsHeaders });
+        }
       }
 
       if (url.pathname === "/increment-usage" && request.method === "POST") {

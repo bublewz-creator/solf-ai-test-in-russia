@@ -212,10 +212,6 @@ module.exports.handler = async function (event, context) {
           expires_at TEXT
         )
       `);
-      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_color TEXT`);
-      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_theme TEXT`);
-      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_lang TEXT`);
-      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_font TEXT`);
       schemaReady = true;
     } catch (err) {
       schemaInitError = err;
@@ -407,6 +403,22 @@ module.exports.handler = async function (event, context) {
 
   function pickUiPref(value, allowed) {
     return allowed.has(value) ? value : null;
+  }
+
+  let uiPrefsReady = false;
+  async function ensureUiPrefsColumns() {
+    if (uiPrefsReady) return true;
+    try {
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_color TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_theme TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_lang TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_font TEXT`);
+      uiPrefsReady = true;
+      return true;
+    } catch (err) {
+      console.warn("[prefs] ui_* columns not ready:", err && err.message);
+      return false;
+    }
   }
 
   function usageSnapshot(user) {
@@ -1317,8 +1329,6 @@ module.exports.handler = async function (event, context) {
       const auth = await requireAuth();
       if (auth.error) return auth.error;
 
-      await ensureKvTable();
-
       const userId = query.id;
       if (!userId) return jsonResponse(400, { error: "No ID" });
       const forbid = forbidSelfOnly(auth.userId, userId);
@@ -1381,7 +1391,8 @@ module.exports.handler = async function (event, context) {
       const auth = await requireAuth();
       if (auth.error) return auth.error;
 
-      await ensureKvTable();
+      const colsOk = await ensureUiPrefsColumns();
+      if (!colsOk) return jsonResponse(200, { ok: false, skipped: "prefs_columns" });
       const userId = auth.userId;
       const color = pickUiPref(body?.color, UI_PREF_ALLOWED.color);
       const theme = pickUiPref(body?.theme, UI_PREF_ALLOWED.theme);
@@ -1392,17 +1403,22 @@ module.exports.handler = async function (event, context) {
         return jsonResponse(200, current || { ok: true });
       }
 
-      const data = await neonQuery(
-        `UPDATE users SET
-           ui_color = COALESCE($2, ui_color),
-           ui_theme = COALESCE($3, ui_theme),
-           ui_lang = COALESCE($4, ui_lang),
-           ui_font = COALESCE($5, ui_font)
-         WHERE id = $1
-         RETURNING *`,
-        [userId, color, theme, lang, font]
-      );
-      return jsonResponse(200, data.rows[0] || { ok: true });
+      try {
+        const data = await neonQuery(
+          `UPDATE users SET
+             ui_color = COALESCE($2, ui_color),
+             ui_theme = COALESCE($3, ui_theme),
+             ui_lang = COALESCE($4, ui_lang),
+             ui_font = COALESCE($5, ui_font)
+           WHERE id = $1
+           RETURNING *`,
+          [userId, color, theme, lang, font]
+        );
+        return jsonResponse(200, data.rows[0] || { ok: true });
+      } catch (err) {
+        console.warn("[prefs] save-prefs failed:", err && err.message);
+        return jsonResponse(200, { ok: false, skipped: "prefs_update" });
+      }
     }
 
     if (pathname === "/increment-usage" && httpMethod === "POST") {

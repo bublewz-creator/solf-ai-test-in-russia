@@ -174,8 +174,7 @@ async function syncAppData() {
             quiz_window_start: Number(data.quiz_window_start) || 0,
         };
         currentPlan = syncedPlan;
-
-        applyUiPrefsFromServer(data);
+        try { applyUiPrefsFromServer(data); } catch (_) {}
 
         // localStorage `solfai_user` и `*_plan` оставляем как кэш (для мгновенного UI до sync).
         // А `solfai_usage_*` / `solfai_img_*` для залогиненных НЕ пишем — БД это источник истины,
@@ -715,11 +714,9 @@ WRAPPING NOTES TO TWO LINES:
 
 SONGS / MELODIES / «песенка» / куплет / мотив / «напиши мелодию»:
 - Exactly ONE [[NOTATION]] block. barlines:"auto" + timeSignature (usually "4/4").
-- Continuous melody: successive SINGLE pitches in notes[] (e.g. c/4, d/4, e/4, f/4, g/4…). 4–8 measures is enough for a simple verse.
-- Do NOT split the song into many tiny blocks or one-measure-per-block.
-- Do NOT insert extra measures that are only T53/D7 whole-note stacks between melody notes. That looks like broken sheet music.
-- Harmony: either stack chord tones on the SAME beat as the melody, or put "label":"T53" / "D7" on a melody note of that measure. Never a separate whole-note chord measure.
-- The renderer keeps short tunes on ONE staff (phone: sideways scroll). Trust it.
+- Continuous melody ONLY: successive SINGLE pitches in notes[] (c/4, d/4, e/4…). 4–8 measures.
+- NO chord-function labels. Do NOT put "label":"T53", "D7", "S53", "D65" or any T/S/D/K labels on a song unless the user explicitly asked to HARMONIZE or ANALYZE («гармонизуй», «подпиши функции», «разбор»).
+- Do NOT insert extra T53/D7 whole-note chord measures. Just the tune.
 
 JSON / DURATIONS:
 - Group durations so each measure sums to the time signature (4/4 → 4 quarter beats; 3/4 → 3; 6/8 → 6 eighths). Mixing durations is fine.
@@ -3278,6 +3275,27 @@ function renderSatbNotationCard(container, data) {
     }
 }
 
+function noteKeyCount(n) {
+    return Array.isArray(n && n.keys) ? n.keys.length : 0;
+}
+
+function isMostlyMonophonicMelody(notes) {
+    const list = (Array.isArray(notes) ? notes : []).filter(n => n && !String(n.duration || '').toLowerCase().includes('r'));
+    if (list.length < 3) return false;
+    const singles = list.filter(n => noteKeyCount(n) <= 1).length;
+    return singles / list.length >= 0.5;
+}
+
+const FUNCTION_LABEL_RE = /^(T|t|S|s|D|d|K|k|VI+|II+|III+|DD|ум\.?|Ум\.?|сп\.?)[\d/₆₄₅₃]*\d?/;
+function stripFunctionLabels(notes) {
+    if (!Array.isArray(notes)) return;
+    notes.forEach(n => {
+        if (!n || typeof n.label !== 'string') return;
+        const compact = n.label.replace(/\s+/g, '');
+        if (FUNCTION_LABEL_RE.test(compact)) delete n.label;
+    });
+}
+
 function renderNotationCard(container, data) {
     data = normalizeNotationLayout(data);
     if (window.SolfTheory && typeof window.SolfTheory.sanitizeNotationData === 'function') {
@@ -3308,9 +3326,14 @@ function renderNotationCard(container, data) {
         const isLight = document.documentElement.getAttribute('data-theme') === 'light';
         const noteColor = isLight ? '#1a1a2e' : '#e6e6f0';
 
-        // Авто-подписи: проставляем label каждому интервалу/аккорду, у которого его ещё нет
-        // (например, блок сгенерировала сама модель). Готовые подписи не трогаем.
-        if (window.SolfTheory && typeof window.SolfTheory.autoLabelNotation === 'function') {
+        const clef = (data.clef === 'bass') ? 'bass' : 'treble';
+        const keySig = normalizeKeySignature(typeof data.keySignature === 'string' ? data.keySignature : 'C');
+        const rawTimeSig = typeof data.timeSignature === 'string' ? data.timeSignature.trim() : '4/4';
+        let rawNotes = Array.isArray(data.notes) ? data.notes : [];
+        const melodyLike = isMostlyMonophonicMelody(rawNotes);
+        if (melodyLike) stripFunctionLabels(rawNotes);
+
+        if (!melodyLike && window.SolfTheory && typeof window.SolfTheory.autoLabelNotation === 'function') {
             try {
                 const labelLang = window.__solfaiResponseLang
                     || (typeof currentLang === 'string' && currentLang)
@@ -3320,13 +3343,10 @@ function renderNotationCard(container, data) {
                     window.SolfTheory.setLabelLocale(labelLang);
                 }
                 window.SolfTheory.autoLabelNotation(data);
+                rawNotes = Array.isArray(data.notes) ? data.notes : rawNotes;
             } catch (_) {}
         }
 
-        const clef = (data.clef === 'bass') ? 'bass' : 'treble';
-        const keySig = normalizeKeySignature(typeof data.keySignature === 'string' ? data.keySignature : 'C');
-        const rawTimeSig = typeof data.timeSignature === 'string' ? data.timeSignature.trim() : '4/4';
-        let rawNotes = Array.isArray(data.notes) ? data.notes : [];
         if (!data.lockOctaves) {
             if (window.SolfTheory && typeof window.SolfTheory.normalizeNotationOctaves === 'function') {
                 try { rawNotes = window.SolfTheory.normalizeNotationOctaves(rawNotes, clef); } catch (_) {}
