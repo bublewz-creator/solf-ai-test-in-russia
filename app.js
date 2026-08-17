@@ -175,6 +175,8 @@ async function syncAppData() {
         };
         currentPlan = syncedPlan;
 
+        applyUiPrefsFromServer(data);
+
         // localStorage `solfai_user` и `*_plan` оставляем как кэш (для мгновенного UI до sync).
         // А `solfai_usage_*` / `solfai_img_*` для залогиненных НЕ пишем — БД это источник истины,
         // эти ключи бы только путали (юзер открыл DevTools → "блин, лимиты в кэше???").
@@ -1852,9 +1854,11 @@ function setTheme(theme) {
         if (el) el.innerHTML = theme === 'light' ? sunIcon : moonIcon;
     });
     refreshVisibleNotations();
+    if (typeof persistUiPrefs === 'function') persistUiPrefs();
 }
 function initTheme() {
-    setTheme(currentTheme);
+    window.__solfSkipPrefPersist = true;
+    try { setTheme(currentTheme); } finally { window.__solfSkipPrefPersist = false; }
     window.addEventListener('storage', (e) => {
         if (e.key === 'solfai_theme' && e.newValue) {
             currentTheme = e.newValue;
@@ -1884,20 +1888,24 @@ function setColor(color) {
         btn.classList.toggle('active', btn.dataset.color === color);
     });
     refreshVisibleNotations();
+    if (typeof persistUiPrefs === 'function') persistUiPrefs();
 }
 
 function initColor() {
-    setColor(currentColor);
+    window.__solfSkipPrefPersist = true;
+    try { setColor(currentColor); } finally { window.__solfSkipPrefPersist = false; }
 }
 
 function setFontSize(size) {
     currentFontSize = size || 'md';
     localStorage.setItem('solfai_font_size', currentFontSize);
     document.documentElement.setAttribute('data-font-size', currentFontSize);
+    if (typeof persistUiPrefs === 'function') persistUiPrefs();
 }
 
 function initFontSize() {
-    setFontSize(currentFontSize);
+    window.__solfSkipPrefPersist = true;
+    try { setFontSize(currentFontSize); } finally { window.__solfSkipPrefPersist = false; }
 }
 
 // ===== ТАРИФЫ И КНОПКА UPGRADE =====

@@ -212,6 +212,10 @@ module.exports.handler = async function (event, context) {
           expires_at TEXT
         )
       `);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_color TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_theme TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_lang TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_font TEXT`);
       schemaReady = true;
     } catch (err) {
       schemaInitError = err;
@@ -392,6 +396,17 @@ module.exports.handler = async function (event, context) {
 
   function canUse(user, type) {
     return remainingUsage(user, type) > 0;
+  }
+
+  const UI_PREF_ALLOWED = {
+    color: new Set(["default", "blue", "green", "rose"]),
+    theme: new Set(["default", "light"]),
+    lang: new Set(["en", "ru", "de", "es", "zh", "ja"]),
+    font: new Set(["sm", "md", "lg"]),
+  };
+
+  function pickUiPref(value, allowed) {
+    return allowed.has(value) ? value : null;
   }
 
   function usageSnapshot(user) {
@@ -1302,6 +1317,8 @@ module.exports.handler = async function (event, context) {
       const auth = await requireAuth();
       if (auth.error) return auth.error;
 
+      await ensureKvTable();
+
       const userId = query.id;
       if (!userId) return jsonResponse(400, { error: "No ID" });
       const forbid = forbidSelfOnly(auth.userId, userId);
@@ -1358,6 +1375,34 @@ module.exports.handler = async function (event, context) {
       const data = await neonQuery(queryText, [user.id, user.email, user.name, user.picture]);
       const fresh = await getUserWithFreshUsage(user.id);
       return jsonResponse(200, fresh || data.rows[0]);
+    }
+
+    if (pathname === "/save-prefs" && httpMethod === "POST") {
+      const auth = await requireAuth();
+      if (auth.error) return auth.error;
+
+      await ensureKvTable();
+      const userId = auth.userId;
+      const color = pickUiPref(body?.color, UI_PREF_ALLOWED.color);
+      const theme = pickUiPref(body?.theme, UI_PREF_ALLOWED.theme);
+      const lang = pickUiPref(body?.lang, UI_PREF_ALLOWED.lang);
+      const font = pickUiPref(body?.font, UI_PREF_ALLOWED.font);
+      if (!color && !theme && !lang && !font) {
+        const current = await fetchUserById(userId);
+        return jsonResponse(200, current || { ok: true });
+      }
+
+      const data = await neonQuery(
+        `UPDATE users SET
+           ui_color = COALESCE($2, ui_color),
+           ui_theme = COALESCE($3, ui_theme),
+           ui_lang = COALESCE($4, ui_lang),
+           ui_font = COALESCE($5, ui_font)
+         WHERE id = $1
+         RETURNING *`,
+        [userId, color, theme, lang, font]
+      );
+      return jsonResponse(200, data.rows[0] || { ok: true });
     }
 
     if (pathname === "/increment-usage" && httpMethod === "POST") {

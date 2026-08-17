@@ -16,7 +16,7 @@ export default {
     const corsHeaders = {
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Methods": "POST, GET, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Auth-Token",
       "Content-Type": "application/json",
     };
 
@@ -132,6 +132,25 @@ export default {
     async function fetchUserById(userId) {
       const data = await neonQuery("SELECT * FROM users WHERE id = $1", [userId]);
       return data.rows[0] || null;
+    }
+
+    let uiPrefsReady = false;
+    const UI_PREF_ALLOWED = {
+      color: new Set(["default", "blue", "green", "rose"]),
+      theme: new Set(["default", "light"]),
+      lang: new Set(["en", "ru", "de", "es", "zh", "ja"]),
+      font: new Set(["sm", "md", "lg"]),
+    };
+    function pickUiPref(value, allowed) {
+      return allowed.has(value) ? value : null;
+    }
+    async function ensureUiPrefsColumns() {
+      if (uiPrefsReady) return;
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_color TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_theme TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_lang TEXT`);
+      await neonQuery(`ALTER TABLE users ADD COLUMN IF NOT EXISTS ui_font TEXT`);
+      uiPrefsReady = true;
     }
 
     async function persistUsageWindows(user) {
@@ -933,6 +952,8 @@ export default {
         const forbid = forbidSelfOnly(auth.userId, userId);
         if (forbid) return forbid;
 
+        await ensureUiPrefsColumns();
+
         // Важно: refillUsageOnPlanUpgrade здесь НЕ вызываем.
         // Раньше клиент слал prev_plan (часто устаревший/free после очистки кэша),
         // и сервер ошибочно считал это апгрейдом → обнулял requests_count в БД
@@ -985,6 +1006,34 @@ export default {
         const data = await neonQuery(query, [user.id, user.email, user.name, user.picture]);
         const fresh = await getUserWithFreshUsage(user.id);
         return new Response(JSON.stringify(fresh || data.rows[0]), { headers: corsHeaders });
+      }
+
+      if (url.pathname === "/save-prefs" && request.method === "POST") {
+        const auth = await requireAuth(request, env);
+        if (auth.error) return auth.error;
+
+        await ensureUiPrefsColumns();
+        const userId = auth.userId;
+        const body = await request.json().catch(() => ({}));
+        const color = pickUiPref(body?.color, UI_PREF_ALLOWED.color);
+        const theme = pickUiPref(body?.theme, UI_PREF_ALLOWED.theme);
+        const lang = pickUiPref(body?.lang, UI_PREF_ALLOWED.lang);
+        const font = pickUiPref(body?.font, UI_PREF_ALLOWED.font);
+        if (!color && !theme && !lang && !font) {
+          const current = await fetchUserById(userId);
+          return new Response(JSON.stringify(current || { ok: true }), { headers: corsHeaders });
+        }
+        const data = await neonQuery(
+          `UPDATE users SET
+             ui_color = COALESCE($2, ui_color),
+             ui_theme = COALESCE($3, ui_theme),
+             ui_lang = COALESCE($4, ui_lang),
+             ui_font = COALESCE($5, ui_font)
+           WHERE id = $1
+           RETURNING *`,
+          [userId, color, theme, lang, font]
+        );
+        return new Response(JSON.stringify(data.rows[0] || { ok: true }), { headers: corsHeaders });
       }
 
       if (url.pathname === "/increment-usage" && request.method === "POST") {

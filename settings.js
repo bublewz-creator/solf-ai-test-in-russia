@@ -21,6 +21,7 @@ function applyTheme(theme) {
     localStorage.setItem('solfai_theme', theme);
     if (theme === 'light') document.documentElement.setAttribute('data-theme', 'light');
     else document.documentElement.removeAttribute('data-theme');
+    if (typeof persistUiPrefs === 'function') persistUiPrefs();
 }
 
 function applyColor(color) {
@@ -28,11 +29,13 @@ function applyColor(color) {
     if (color === 'default') document.documentElement.removeAttribute('data-color');
     else document.documentElement.setAttribute('data-color', color);
     document.querySelectorAll('.color-btn').forEach((btn) => btn.classList.toggle('active', btn.dataset.color === color));
+    if (typeof persistUiPrefs === 'function') persistUiPrefs();
 }
 
 function applyFontSize(size) {
     localStorage.setItem('solfai_font_size', size);
     document.documentElement.setAttribute('data-font-size', size || 'md');
+    if (typeof persistUiPrefs === 'function') persistUiPrefs();
 }
 
 function renderTexts() {
@@ -95,7 +98,10 @@ function getCurrentSettingValue(setting) {
 }
 
 function applySettingValue(setting, value) {
-    if (setting === 'lang') localStorage.setItem('solfai_lang', value);
+    if (setting === 'lang') {
+        localStorage.setItem('solfai_lang', value);
+        if (typeof persistUiPrefs === 'function') persistUiPrefs();
+    }
     if (setting === 'theme') applyTheme(value);
     if (setting === 'font') applyFontSize(value);
     renderTexts();
@@ -219,14 +225,38 @@ function bindSettingsPicker() {
     });
 }
 
+function pullUiPrefsFromServer() {
+    const token = typeof getSolfSessionToken === 'function' ? getSolfSessionToken() : '';
+    if (!token || typeof workerApi !== 'function' || typeof applyUiPrefsFromServer !== 'function') return;
+    let user = null;
+    try { user = JSON.parse(localStorage.getItem('solfai_user') || 'null'); } catch (_) {}
+    if (!user?.id) return;
+    fetch(workerApi('/get-user', { id: user.id }), {
+        headers: typeof solfAuthHeaders === 'function' ? solfAuthHeaders() : {},
+    }).then((res) => res.json().then((data) => ({ res, data }))).then(({ res, data }) => {
+        if (!res.ok || data.error) return;
+        applyUiPrefsFromServer(data);
+        window.__solfSkipPrefPersist = true;
+        applyTheme(getUiTheme());
+        applyColor(localStorage.getItem('solfai_color') || 'default');
+        applyFontSize(getUiFont());
+        window.__solfSkipPrefPersist = false;
+        renderTexts();
+        renderValueBadges();
+    }).catch(() => {});
+}
+
 function initSettingsPage() {
+    window.__solfSkipPrefPersist = true;
     applyTheme(getUiTheme());
     applyColor(localStorage.getItem('solfai_color') || 'default');
     applyFontSize(getUiFont());
+    window.__solfSkipPrefPersist = false;
     renderTexts();
     renderValueBadges();
     renderUser();
     bindSettingsPicker();
+    pullUiPrefsFromServer();
 
     document.querySelectorAll('.color-btn').forEach((btn) => {
         btn.addEventListener('click', () => applyColor(btn.dataset.color));

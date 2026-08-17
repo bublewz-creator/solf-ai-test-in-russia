@@ -847,6 +847,7 @@ function setLanguage(lang) {
         localStorage.setItem('solfai_lang', lang);
         updateTexts();
         if (typeof renderChatsList === 'function') renderChatsList();
+        if (typeof persistUiPrefs === 'function') persistUiPrefs();
     }
 }
 
