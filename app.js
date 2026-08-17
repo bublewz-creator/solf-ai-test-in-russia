@@ -467,6 +467,33 @@ function isMobileLayout() {
     return typeof window.matchMedia === 'function' && window.matchMedia('(max-width: 768px)').matches;
 }
 
+let maxVisualViewportHeight = 0;
+function syncMobileKeyboardLayout() {
+    const root = document.documentElement;
+    const vv = window.visualViewport;
+    if (!vv || !isMobileLayout()) {
+        root.classList.remove('keyboard-open');
+        root.style.removeProperty('--kb-empty-top');
+        root.style.removeProperty('--kb-empty-height');
+        return;
+    }
+    if (vv.height > maxVisualViewportHeight) maxVisualViewportHeight = vv.height;
+    const keyboardOpen = (maxVisualViewportHeight - vv.height > 80) || (vv.offsetTop > 24);
+    root.classList.toggle('keyboard-open', keyboardOpen);
+    if (!keyboardOpen) {
+        root.style.removeProperty('--kb-empty-top');
+        root.style.removeProperty('--kb-empty-height');
+        return;
+    }
+    try { window.scrollTo(0, 0); } catch (_) {}
+    const inputEl = document.querySelector('.chat-input-container');
+    const inputH = inputEl ? inputEl.getBoundingClientRect().height : 88;
+    const top = Math.max(0, Math.round(vv.offsetTop));
+    const height = Math.max(96, Math.round(vv.height - inputH - 8));
+    root.style.setProperty('--kb-empty-top', top + 'px');
+    root.style.setProperty('--kb-empty-height', height + 'px');
+}
+
 /** Мобильный drawer: класс на body отключает pointer-events у #chatPage и всех потомков */
 function syncMobileSidebarDrawerState() {
     const sb = document.getElementById('sidebar');
@@ -4585,6 +4612,7 @@ document.addEventListener('DOMContentLoaded', () => {
     
     if (window.visualViewport) {
         let lastVisualViewportHeight = window.visualViewport.height;
+        maxVisualViewportHeight = window.visualViewport.height;
         const syncViewportCssVar = () => {
             if (window.innerWidth >= 768) {
                 document.documentElement.style.setProperty('--vh', `${window.visualViewport.height * 0.01}px`);
@@ -4592,8 +4620,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 document.documentElement.style.setProperty('--vh', `${window.innerHeight * 0.01}px`);
             }
         };
-        window.visualViewport.addEventListener('resize', () => {
+        const onVisualViewportChange = () => {
             syncViewportCssVar();
+            syncMobileKeyboardLayout();
             const vv = window.visualViewport;
             const currentHeight = vv.height;
             // Пользователь свернул клавиатуру вручную — фокус в textarea остаётся, iOS поднимет её снова при тапе.
@@ -4609,9 +4638,22 @@ document.addEventListener('DOMContentLoaded', () => {
             lastVisualViewportHeight = currentHeight;
             if (document.activeElement === chatInput) return;
             setTimeout(() => scrollToBottom(true), 50);
-        });
+        };
+        window.visualViewport.addEventListener('resize', onVisualViewportChange);
+        window.visualViewport.addEventListener('scroll', syncMobileKeyboardLayout);
         syncViewportCssVar();
+        syncMobileKeyboardLayout();
     }
+    if (chatInput) {
+        chatInput.addEventListener('focus', () => {
+            setTimeout(syncMobileKeyboardLayout, 50);
+            setTimeout(syncMobileKeyboardLayout, 250);
+        });
+        chatInput.addEventListener('blur', () => {
+            setTimeout(syncMobileKeyboardLayout, 80);
+        });
+    }
+    window.addEventListener('resize', syncMobileKeyboardLayout);
     
     const modals = document.querySelectorAll('.limit-modal, .quiz-modal, .tool-modal, .exit-modal-overlay');
     const obs = new MutationObserver(() => { document.body.style.overflow = Array.from(modals).some(m => m.classList.contains('active')) ? 'hidden' : ''; });

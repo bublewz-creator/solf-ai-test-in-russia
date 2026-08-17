@@ -465,8 +465,23 @@ button:focus:not(:focus-visible) {
 .empty-chat-state {
     position: absolute; inset: 0; bottom: 120px; 
     display: flex; flex-direction: column; justify-content: center; align-items: center;
-    opacity: 1; transition: opacity 0.3s; pointer-events: none; z-index: 10;
+    opacity: 1; transition: opacity 0.3s, top 0.2s ease, height 0.2s ease; pointer-events: none; z-index: 10;
     top: 40% !important; bottom: auto !important; transform: translateY(-50%) !important;
+}
+/* Клавиатура на мобилке: держим заголовок в видимой полосе над инпутом */
+html.keyboard-open .empty-chat-state {
+    position: fixed !important;
+    top: var(--kb-empty-top, 8px) !important;
+    height: var(--kb-empty-height, auto) !important;
+    left: 0 !important;
+    right: 0 !important;
+    bottom: auto !important;
+    transform: none !important;
+    justify-content: center;
+    padding: 8px 12px;
+    box-sizing: border-box;
+    overflow: visible;
+    z-index: 90;
 }
 .chat-subtitle { font-size: 1.1rem; color: var(--text-secondary); margin-top: 10px; max-width: 80%; text-align: center; }
 
