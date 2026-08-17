@@ -67,8 +67,9 @@ html[data-font-size="lg"] {
     font-size: 18px;
 }
 
-/* Отключение всех анимаций и переходов во время загрузки страницы */
-.preload * {
+/* Отключение всех анимаций и переходов во время загрузки страницы.
+   hello-playing — исключение: заставка с подписью должна рисоваться поверх preload. */
+body.preload:not(.hello-playing) * {
     -webkit-transition: none !important;
     -moz-transition: none !important;
     -ms-transition: none !important;
@@ -83,13 +84,23 @@ body.preload {
     pointer-events: none;
 }
 
+html.hello-playing body.preload {
+    opacity: 1 !important;
+    pointer-events: auto;
+}
+
+html.hello-playing body.preload > *:not(.solf-hello) {
+    visibility: hidden;
+    pointer-events: none;
+}
+
 body.app-ready {
     opacity: 1;
     transition: opacity .15s ease-out;
 }
 
 /* Отключение всех переходов (без анимаций) через no-transition */
-.no-transition * {
+.no-transition *:not(.solf-hello):not(.solf-hello *) {
     -webkit-transition: none !important;
     -moz-transition: none !important;
     -ms-transition: none !important;
@@ -1500,4 +1511,72 @@ button:focus:not(:focus-visible) {
     font-size: 14px;
     letter-spacing: 0;
     user-select: none;
+}
+
+/* ===== Apple Hello signature ===== */
+.solf-hello {
+    position: fixed;
+    inset: 0;
+    z-index: 100000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: var(--bg-primary);
+    cursor: pointer;
+    opacity: 1;
+    transition: opacity 0.7s ease;
+}
+
+.solf-hello.is-done {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.solf-hello-svg {
+    width: min(88vw, 760px);
+    height: auto;
+    overflow: visible;
+    filter: drop-shadow(0 0 28px rgba(139, 92, 246, 0.32));
+}
+
+.solf-hello-svg--inline {
+    width: 100%;
+    max-width: 300px;
+    filter: drop-shadow(0 8px 18px rgba(139, 92, 246, 0.22));
+}
+
+.solf-hello-stop-start {
+    stop-color: var(--text-primary);
+}
+
+.solf-hello-stop-end {
+    stop-color: var(--purple-soft);
+}
+
+.solf-hello-path {
+    stroke-width: 9px;
+    vector-effect: non-scaling-stroke;
+    stroke-dasharray: 1;
+    stroke-dashoffset: 1;
+    animation: solf-hello-write 2.8s cubic-bezier(0.37, 0.01, 0.2, 1) forwards;
+}
+
+.solf-hello-svg--inline .solf-hello-path {
+    stroke-width: 5.5px;
+    animation-duration: 2.2s;
+}
+
+@keyframes solf-hello-write {
+    to { stroke-dashoffset: 0; }
+}
+
+[data-theme="light"] .solf-hello-svg {
+    filter: drop-shadow(0 0 18px rgba(139, 92, 246, 0.2));
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .solf-hello-path {
+        animation: none;
+        stroke-dashoffset: 0;
+    }
 }

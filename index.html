@@ -93,7 +93,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     
-    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com https://cdn.statically.io https://accounts.google.com https://accounts.google.com/gsi/client https://id.vk.com https://id.vk.ru; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com https://accounts.google.com/gsi/; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https://*.googleusercontent.com https://lh3.googleusercontent.com https://*.userapi.com https://*.vk.com https://vk.com; connect-src 'self' https://functions.yandexcloud.net https://cdn.jsdelivr.net https://unpkg.com https://cdn.statically.io https://accounts.google.com https://id.vk.com https://id.vk.ru; frame-src https://accounts.google.com https://id.vk.com https://id.vk.ru; object-src 'none'; base-uri 'self'; form-action 'self';">
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com https://cdn.statically.io https://accounts.google.com https://accounts.google.com/gsi/client https://id.vk.com https://id.vk.ru; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com https://accounts.google.com/gsi/; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https://*.googleusercontent.com https://lh3.googleusercontent.com https://*.userapi.com https://*.vk.com https://vk.com; connect-src 'self' https://functions.yandexcloud.net https://cdn.jsdelivr.net https://unpkg.com https://cdn.statically.io https://accounts.google.com https://id.vk.com https://id.vk.ru http://127.0.0.1:7330; frame-src https://accounts.google.com https://id.vk.com https://id.vk.ru; object-src 'none'; base-uri 'self'; form-action 'self';">
     <meta name="referrer" content="no-referrer">
     <meta http-equiv="X-Content-Type-Options" content="nosniff">
     
@@ -123,7 +123,7 @@
          в app.js). Это убирает accounts.google.com из критического пути загрузки — у части
          пользователей без VPN запрос подвисает на несколько секунд и тормозит весь UI. -->
     
-    <link rel="stylesheet" href="styles.css?v=9">
+    <link rel="stylesheet" href="styles.css?v=10">
 
     <style>
         /* Auth-dependent visibility — classes set synchronously in <head>, no FOUC */
@@ -266,10 +266,13 @@
     </style>
 </head>
 <body class="preload">
+    <script src="hello.js?v=1"></script>
     <script>
+        try { if (window.SolfHello) window.SolfHello.mountSplash(); } catch (_) {}
         /* Fallback: if app.js fails to load, still reveal UI after 4s (body.preload = opacity 0). */
         setTimeout(function () {
             try {
+                if (document.documentElement.classList.contains('hello-playing')) return;
                 document.body.classList.remove('preload', 'no-transition');
                 document.body.classList.add('app-ready');
             } catch (_) {}
@@ -517,6 +520,6 @@
     <!-- theory-kb.js должен идти ПЕРЕД theory.js: движок берёт из него правила для промпта. -->
     <script src="theory-kb.js?v=5"></script>
     <script src="theory.js?v=48"></script>
-    <script src="app.js?v=79"></script>
+    <script src="app.js?v=80"></script>
 </body>
 </html>
