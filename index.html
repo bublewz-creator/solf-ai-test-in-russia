@@ -91,7 +91,7 @@
     <script async src="https://cdn.jsdelivr.net/npm/vexflow@4.2.2/build/cjs/vexflow.js"
             onerror="this.onerror=null;var s=document.createElement('script');s.async=true;s.src='https://unpkg.com/vexflow@4.2.2/build/cjs/vexflow.js';s.onerror=function(){this.onerror=null;var s2=document.createElement('script');s2.async=true;s2.src='https://cdn.statically.io/npm/vexflow@4.2.2/build/cjs/vexflow.js';document.head.appendChild(s2);};document.head.appendChild(s);"></script>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover, interactive-widget=resizes-content">
     
     <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://unpkg.com https://cdn.statically.io https://accounts.google.com https://accounts.google.com/gsi/client https://id.vk.com https://id.vk.ru; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://accounts.google.com https://accounts.google.com/gsi/; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https://*.googleusercontent.com https://lh3.googleusercontent.com https://*.userapi.com https://*.vk.com https://vk.com; connect-src 'self' https://functions.yandexcloud.net https://cdn.jsdelivr.net https://unpkg.com https://cdn.statically.io https://accounts.google.com https://id.vk.com https://id.vk.ru http://127.0.0.1:7330; frame-src https://accounts.google.com https://id.vk.com https://id.vk.ru; object-src 'none'; base-uri 'self'; form-action 'self';">
     <meta name="referrer" content="no-referrer">
@@ -123,7 +123,7 @@
          в app.js). Это убирает accounts.google.com из критического пути загрузки — у части
          пользователей без VPN запрос подвисает на несколько секунд и тормозит весь UI. -->
     
-    <link rel="stylesheet" href="styles.css?v=12">
+    <link rel="stylesheet" href="styles.css?v=13">
 
     <style>
         /* Auth-dependent visibility — classes set synchronously in <head>, no FOUC */
@@ -544,6 +544,6 @@
     <!-- theory-kb.js должен идти ПЕРЕД theory.js: движок берёт из него правила для промпта. -->
     <script src="theory-kb.js?v=5"></script>
     <script src="theory.js?v=50"></script>
-    <script src="app.js?v=88"></script>
+    <script src="app.js?v=89"></script>
 </body>
 </html>

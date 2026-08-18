@@ -501,23 +501,47 @@ function syncMobileKeyboardLayout() {
         root.classList.remove('keyboard-open');
         root.style.removeProperty('--kb-empty-top');
         root.style.removeProperty('--kb-empty-height');
+        root.style.removeProperty('--vv-top');
+        root.style.removeProperty('--vv-height');
+        root.style.removeProperty('--kb-inset');
+        root.style.removeProperty('--kb-input-h');
         return;
     }
     if (vv.height > maxVisualViewportHeight) maxVisualViewportHeight = vv.height;
-    const keyboardOpen = (maxVisualViewportHeight - vv.height > 80) || (vv.offsetTop > 24);
+
+    const vvTop = Math.max(0, vv.offsetTop || 0);
+    const vvHeight = Math.max(0, vv.height || 0);
+    const vvBottom = vvTop + vvHeight;
+    const kbInset = Math.max(0, window.innerHeight - vvBottom);
+    const keyboardOpen = kbInset > 60 || (maxVisualViewportHeight - vvHeight > 80);
+
+    root.style.setProperty('--vv-top', Math.round(vvTop) + 'px');
+    root.style.setProperty('--vv-height', Math.round(vvHeight) + 'px');
+    root.style.setProperty('--kb-inset', Math.round(kbInset) + 'px');
     root.classList.toggle('keyboard-open', keyboardOpen);
+
     if (!keyboardOpen) {
         root.style.removeProperty('--kb-empty-top');
         root.style.removeProperty('--kb-empty-height');
+        root.style.removeProperty('--kb-input-h');
         return;
     }
+
     try { window.scrollTo(0, 0); } catch (_) {}
     const inputEl = document.querySelector('.chat-input-container');
-    const inputH = inputEl ? inputEl.getBoundingClientRect().height : 88;
-    const top = Math.max(0, Math.round(vv.offsetTop));
-    const height = Math.max(96, Math.round(vv.height - inputH - 8));
+    const inputH = inputEl ? Math.ceil(inputEl.getBoundingClientRect().height) : 88;
+    root.style.setProperty('--kb-input-h', inputH + 'px');
+    const top = Math.max(0, Math.round(vvTop));
+    const height = Math.max(72, Math.round(vvHeight - inputH - 8));
     root.style.setProperty('--kb-empty-top', top + 'px');
     root.style.setProperty('--kb-empty-height', height + 'px');
+
+    const ta = document.getElementById('chatInput');
+    if (ta && document.activeElement === ta) {
+        requestAnimationFrame(() => {
+            try { ta.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch (_) {}
+        });
+    }
 }
 
 /** Мобильный drawer: класс на body отключает pointer-events у #chatPage и всех потомков */
@@ -2829,7 +2853,7 @@ function drawChordLabelsBelow(svg, stave, staveNotes, notesData, color) {
     const NS = 'http://www.w3.org/2000/svg';
     let labelY = (stave.y || 0) + 98;
     try {
-        if (typeof stave.getBottomY === 'function') labelY = stave.getBottomY() + 20;
+        if (typeof stave.getBottomY === 'function') labelY = stave.getBottomY() + 14;
     } catch (_) {}
     const MIN_X_GAP = 36;
     const ROW_H = 18;
@@ -2855,9 +2879,29 @@ function drawChordLabelsBelow(svg, stave, staveNotes, notesData, color) {
         t.setAttribute('font-size', '16');
         t.setAttribute('font-weight', '600');
         t.setAttribute('fill', color);
-        t.textContent = normalizeIntervalLabel(lbl);
+        t.appendChild(document.createTextNode(normalizeIntervalLabel(lbl)));
         svg.appendChild(t);
     });
+}
+
+function fitNotationSvgToContent(svg) {
+    if (!svg) return;
+    let maxY = 0;
+    try {
+        svg.querySelectorAll('text, path, rect, line, ellipse, polygon, g').forEach((el) => {
+            if (typeof el.getBBox !== 'function') return;
+            try {
+                const b = el.getBBox();
+                if (!b || !Number.isFinite(b.y) || !Number.isFinite(b.height)) return;
+                maxY = Math.max(maxY, b.y + b.height);
+            } catch (_) {}
+        });
+    } catch (_) {}
+    if (maxY < 40) return;
+    const h = Math.ceil(maxY + 18);
+    const w = Number(svg.getAttribute('width')) || (svg.viewBox && svg.viewBox.baseVal && svg.viewBox.baseVal.width) || 0;
+    svg.setAttribute('height', String(h));
+    if (w) svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
 }
 
 function vfKeyLine(VF, key, clef) {
@@ -3199,9 +3243,9 @@ function renderSatbNotationCard(container, data) {
         });
 
         const STAVE_GAP = 78;
-        const ROW_HEIGHT = 188;
+        const ROW_HEIGHT = 210;
         const TOP_PAD = 12;
-        const totalHeight = rows.length * ROW_HEIGHT + TOP_PAD + 40;
+        const totalHeight = rows.length * ROW_HEIGHT + TOP_PAD + 56;
         const rowPixelW = rows.reduce((mx, r) => Math.max(mx, r.reduce((s, mm) => s + mm.width, 0)), 0);
         const totalWidth = Math.max(maxW + 16, rowPixelW + 16);
 
@@ -3296,6 +3340,7 @@ function renderSatbNotationCard(container, data) {
                 if (stroke && stroke !== 'none') el.setAttribute('stroke', noteColor);
             });
             svg.querySelectorAll('text').forEach(el => el.setAttribute('fill', noteColor));
+            try { fitNotationSvgToContent(svg); } catch (_) {}
         }
     } catch (err) {
         console.error('[Solf-ai] SATB VexFlow render error:', err);
@@ -3453,9 +3498,9 @@ function renderNotationCard(container, data) {
             }
         });
 
-        const ROW_HEIGHT = hasLabels ? 128 : 108;
+        const ROW_HEIGHT = hasLabels ? 156 : 108;
         const TOP_PAD = 10;
-        const totalHeight = rows.length * ROW_HEIGHT + TOP_PAD + (hasLabels ? 28 : 18);
+        const totalHeight = rows.length * ROW_HEIGHT + TOP_PAD + (hasLabels ? 52 : 18);
         const rowPixelW = rows.reduce((mx, r) => Math.max(mx, r.reduce((s, mm) => s + mm.width, 0)), 0);
         const totalWidth = Math.max(maxW + 16, rowPixelW + 16);
 
@@ -3528,6 +3573,7 @@ function renderNotationCard(container, data) {
                 if (stroke && stroke !== 'none') el.setAttribute('stroke', noteColor);
             });
             svg.querySelectorAll('text').forEach(el => el.setAttribute('fill', noteColor));
+            try { fitNotationSvgToContent(svg); } catch (_) {}
         }
     } catch (err) {
         console.error('[Solf-ai] VexFlow render error:', err);
@@ -4744,6 +4790,7 @@ document.addEventListener('DOMContentLoaded', () => {
         chatInput.addEventListener('focus', () => {
             setTimeout(syncMobileKeyboardLayout, 50);
             setTimeout(syncMobileKeyboardLayout, 250);
+            setTimeout(syncMobileKeyboardLayout, 450);
         });
         chatInput.addEventListener('blur', () => {
             setTimeout(syncMobileKeyboardLayout, 80);
