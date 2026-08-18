@@ -42,7 +42,7 @@ function getPgPool() {
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Auth-Token",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Requested-With, X-Auth-Token, X-Solf-Path",
 };
 
 /** Единый helper: любой ответ функции всегда с CORS. */
@@ -70,15 +70,25 @@ function getHeader(headers, name) {
   return "";
 }
 
-function getPathname(event) {
+function firstParam(value) {
+  if (value == null || value === "") return "";
+  if (Array.isArray(value)) return String(value[0] || "");
+  return String(value);
+}
+
+function normalizeRoutePath(raw) {
+  const p = String(raw || "").trim();
+  if (!p) return "";
+  return p.startsWith("/") ? p : "/" + p;
+}
+
+function getPathname(event, headers, query) {
   // Прямой HTTPS-вызов Яндекса НЕ поддерживает суффиксы пути
   // (/d4e.../auth/google → "invalid functionID"). Роут передаём через ?path=
-  const qp = event.queryStringParameters || {};
-  const fromQuery = qp.path || qp.route || "";
-  if (fromQuery) {
-    const p = String(fromQuery);
-    return p.startsWith("/") ? p : "/" + p;
-  }
+  const fromHeader = getHeader(headers, "X-Solf-Path");
+  const fromQuery = (query && (query.path || query.route)) || "";
+  const routed = normalizeRoutePath(fromHeader || fromQuery);
+  if (routed) return routed;
 
   const raw = event.url || event.path || event.requestContext?.http?.path || "/";
   let path = "/";
@@ -115,9 +125,18 @@ function getHttpMethod(event, headers) {
 }
 
 function getQueryParams(event) {
-  if (event.queryStringParameters && typeof event.queryStringParameters === "object") {
-    return event.queryStringParameters;
+  const out = {};
+  const qp = event.queryStringParameters;
+  if (qp && typeof qp === "object") {
+    for (const [key, value] of Object.entries(qp)) out[key] = firstParam(value);
   }
+  const mv = event.multiValueQueryStringParameters;
+  if (mv && typeof mv === "object") {
+    for (const [key, value] of Object.entries(mv)) {
+      if (!out[key]) out[key] = firstParam(value);
+    }
+  }
+  if (Object.keys(out).length) return out;
   const raw = event.url || event.path || "";
   try {
     if (/^https?:\/\//i.test(raw)) {
@@ -128,7 +147,6 @@ function getQueryParams(event) {
   } catch (_) {}
   const q = raw.indexOf("?");
   if (q < 0) return {};
-  const out = {};
   new URLSearchParams(raw.slice(q + 1)).forEach((v, k) => { out[k] = v; });
   return out;
 }
@@ -152,8 +170,9 @@ module.exports.handler = async function (event, context) {
     event = event || {};
     const headers = event.headers || {};
     const httpMethod = getHttpMethod(event, headers);
-    const pathname = getPathname(event);
     const query = getQueryParams(event);
+    let pathname = getPathname(event, headers, query);
+    console.log("[req]", httpMethod, pathname);
 
     // CORS preflight — сразу 200 с CORS-заголовками
     if (event.httpMethod === "OPTIONS" || httpMethod === "OPTIONS") {
@@ -214,6 +233,16 @@ module.exports.handler = async function (event, context) {
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL,
           expires_at TEXT
+        )
+      `);
+      await neonQuery(`
+        CREATE TABLE IF NOT EXISTS user_prefs (
+          user_id TEXT PRIMARY KEY,
+          color TEXT,
+          theme TEXT,
+          lang TEXT,
+          font TEXT,
+          updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
         )
       `);
       schemaReady = true;
@@ -435,6 +464,17 @@ module.exports.handler = async function (event, context) {
   async function readUiPrefs(userId) {
     if (!userId) return null;
     try {
+      await ensureKvTable();
+      const data = await neonQuery(
+        `SELECT color, theme, lang, font FROM user_prefs WHERE user_id = $1`,
+        [userId]
+      );
+      const fromTable = normalizeUiPrefs(data.rows && data.rows[0]);
+      if (fromTable) return fromTable;
+    } catch (err) {
+      console.warn("[prefs] table read failed:", err && err.message);
+    }
+    try {
       return parseUiPrefsValue(await kv.get(uiPrefsKey(userId)));
     } catch (err) {
       console.warn("[prefs] kv read failed:", err && err.message);
@@ -443,12 +483,28 @@ module.exports.handler = async function (event, context) {
   }
 
   async function writeUiPrefs(userId, prefs) {
-    await kv.put(uiPrefsKey(userId), JSON.stringify({
-      color: prefs.color || null,
-      theme: prefs.theme || null,
-      lang: prefs.lang || null,
-      font: prefs.font || null,
-    }));
+    await ensureKvTable();
+    await neonQuery(
+      `INSERT INTO user_prefs (user_id, color, theme, lang, font, updated_at)
+       VALUES ($1, $2, $3, $4, $5, CURRENT_TIMESTAMP)
+       ON CONFLICT (user_id) DO UPDATE SET
+         color = EXCLUDED.color,
+         theme = EXCLUDED.theme,
+         lang = EXCLUDED.lang,
+         font = EXCLUDED.font,
+         updated_at = CURRENT_TIMESTAMP`,
+      [userId, prefs.color || null, prefs.theme || null, prefs.lang || null, prefs.font || null]
+    );
+    try {
+      await kv.put(uiPrefsKey(userId), JSON.stringify({
+        color: prefs.color || null,
+        theme: prefs.theme || null,
+        lang: prefs.lang || null,
+        font: prefs.font || null,
+      }));
+    } catch (err) {
+      console.warn("[prefs] kv backup skipped:", err && err.message);
+    }
   }
 
   function prefsToUserFields(prefs) {
@@ -1282,11 +1338,15 @@ module.exports.handler = async function (event, context) {
     const body = (httpMethod === "POST" || httpMethod === "PUT" || httpMethod === "PATCH")
       ? parseBody(event)
       : null;
+    if (body && typeof body._path === "string") {
+      const fromBody = normalizeRoutePath(body._path);
+      if (fromBody) pathname = fromBody;
+    }
 
     if (httpMethod === "GET" && pathname === "/health") {
       const info = {
         ok: true,
-        build: "2026-08-17-prefs1",
+        build: "2026-08-18-db2",
         generateProvider: "deepseek",
         deepseekModel: process.env.DEEPSEEK_MODEL || "deepseek-v4-flash",
         hasDatabaseUrl: Boolean(process.env.DATABASE_URL),
@@ -1305,6 +1365,16 @@ module.exports.handler = async function (event, context) {
         try {
           await ensureKvTable();
           info.kv_store = "ok";
+          const counts = await neonQuery(`
+            SELECT
+              (SELECT COUNT(*)::int FROM users) AS users,
+              (SELECT COUNT(*)::int FROM chats) AS chats,
+              (SELECT COUNT(*)::int FROM user_prefs) AS prefs
+          `);
+          const row = (counts.rows && counts.rows[0]) || {};
+          info.users = Number(row.users) || 0;
+          info.chats = Number(row.chats) || 0;
+          info.prefs = Number(row.prefs) || 0;
         } catch (kvErr) {
           info.kv_store = "fail";
           info.kv_error = kvErr.message || String(kvErr);
@@ -1467,6 +1537,7 @@ module.exports.handler = async function (event, context) {
 
       try {
         await writeUiPrefs(userId, prefs);
+        console.log("[save-prefs]", userId, prefs.lang, prefs.color);
       } catch (err) {
         console.error("[prefs] kv write failed:", err && err.message);
         return jsonResponse(500, { error: "Failed to save prefs", ok: false });
@@ -1691,11 +1762,13 @@ module.exports.handler = async function (event, context) {
       const auth = await requireAuth();
       if (auth.error) return auth.error;
 
-      const chat = body;
+      const chat = { ...(body || {}) };
+      delete chat._path;
       if (!chat?.id || !chat?.user_id) return jsonResponse(400, { error: "Missing id or user_id" });
       const forbid = forbidSelfOnly(auth.userId, chat.user_id);
       if (forbid) return forbid;
 
+      await ensureKvTable();
       const queryText = `
         INSERT INTO chats (id, user_id, title, messages)
         VALUES ($1, $2, $3, $4)
@@ -1703,6 +1776,7 @@ module.exports.handler = async function (event, context) {
         SET title = $3, messages = $4, updated_at = CURRENT_TIMESTAMP;
       `;
       await neonQuery(queryText, [chat.id, chat.user_id, chat.title || "New Chat", JSON.stringify(chat)]);
+      console.log("[save-chat]", chat.id, chat.user_id);
       return jsonResponse(200, { success: true });
     }
 
@@ -1714,6 +1788,8 @@ module.exports.handler = async function (event, context) {
       if (!userId) return jsonResponse(400, { error: "Missing user_id" });
       const forbid = forbidSelfOnly(auth.userId, userId);
       if (forbid) return forbid;
+
+      await ensureKvTable();
 
       const queryText = `SELECT messages FROM chats WHERE user_id = $1 ORDER BY updated_at DESC;`;
       const data = await neonQuery(queryText, [userId]);

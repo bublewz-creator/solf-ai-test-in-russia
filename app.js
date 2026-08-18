@@ -113,7 +113,10 @@ async function apiFetch(url, options = {}, timeoutMs = 25000) {
     }
     const t0 = Date.now();
     let path = String(url);
-    try { path = new URL(url).searchParams.get('path') || path; } catch (_) {}
+    try {
+        path = new URL(url).searchParams.get('path') || path;
+        if (path && String(path).startsWith('/')) headers['X-Solf-Path'] = path;
+    } catch (_) {}
     try {
         const res = await fetchWithTimeout(url, { ...options, headers }, timeoutMs);
         // #region agent log
@@ -2310,6 +2313,11 @@ function saveChatToServer(chat) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ...chat, pinned: !!chat.pinned, user_id: currentUser.id })
+    }).then(async (res) => {
+        if (!res.ok) {
+            const data = await res.json().catch(() => ({}));
+            console.error('Failed to save chat:', res.status, data);
+        }
     }).catch(err => console.error('Failed to save chat:', err));
 }
 

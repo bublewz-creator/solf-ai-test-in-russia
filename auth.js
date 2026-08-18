@@ -92,14 +92,16 @@ function persistUiPrefs(immediate) {
         const payload = collectUiPrefs();
         fetch(workerApi('/save-prefs'), {
             method: 'POST',
-            headers: solfAuthHeaders({ 'Content-Type': 'application/json' }),
+            headers: solfAuthHeaders({ 'Content-Type': 'application/json', 'X-Solf-Path': '/save-prefs' }),
             body: JSON.stringify(payload),
         }).then(async (res) => {
             const data = await res.json().catch(() => ({}));
             if (res.ok && data && data.ok !== false && !data.error && !data.skipped) {
                 uiPrefsDirty = false;
+            } else {
+                console.error('Failed to save prefs:', res.status, data);
             }
-        }).catch(() => {});
+        }).catch((err) => { console.error('Failed to save prefs:', err); });
     };
 
     if (immediate) send();
