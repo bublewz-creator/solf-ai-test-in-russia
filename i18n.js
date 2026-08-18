@@ -138,7 +138,7 @@ const translations = {
         signInToChangePlan: 'Sign in to change your plan',
         quotaRequests: 'Requests',
         quotaImages: 'Images',
-        langFlag: '🇺🇸'
+        langFlag: 'EN'
     },
     ru: {
         pricing: 'Тарифы',
@@ -278,7 +278,7 @@ const translations = {
         signInToChangePlan: 'Войдите в аккаунт, чтобы изменить тариф',
         quotaRequests: 'Запросов',
         quotaImages: 'Картинок',
-        langFlag: '🇷🇺'
+        langFlag: 'RU'
     },
     de: {
         pricing: 'Preise',
@@ -415,7 +415,7 @@ const translations = {
         signInToChangePlan: 'Melden Sie sich an, um den Tarif zu ändern',
         quotaRequests: 'Anfragen',
         quotaImages: 'Bilder',
-        langFlag: '🇩🇪'
+        langFlag: 'DE'
     },
     es: {
         pricing: 'Precios',
@@ -552,7 +552,7 @@ const translations = {
         signInToChangePlan: 'Inicia sesión para cambiar tu plan',
         quotaRequests: 'Solicitudes',
         quotaImages: 'Imágenes',
-        langFlag: '🇪🇸'
+        langFlag: 'ES'
     },
     zh: {
         pricing: '定价',
@@ -689,7 +689,7 @@ const translations = {
         signInToChangePlan: '登录后可更改套餐',
         quotaRequests: '请求',
         quotaImages: '图片',
-        langFlag: '🇨🇳'
+        langFlag: 'ZH'
     },
     ja: {
         pricing: '料金',
@@ -826,7 +826,7 @@ const translations = {
         signInToChangePlan: 'プランを変更するにはサインインしてください',
         quotaRequests: 'リクエスト',
         quotaImages: '画像',
-        langFlag: '🇯🇵'
+        langFlag: 'JA'
     }
 };
 
@@ -883,7 +883,7 @@ function updateTexts() {
     });
 
     if (typeof document !== 'undefined') {
-        const currentFlag = t.langFlag || '🇺🇸';
+        const currentFlag = t.langFlag || 'EN';
         // Обновляем флаги везде, где они есть (в шапке и в сайдбаре)
         document.querySelectorAll('#currentLangFlag, #headerLangFlag').forEach(el => {
             if (el) el.textContent = currentFlag;
