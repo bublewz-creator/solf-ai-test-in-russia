@@ -178,6 +178,7 @@ async function syncAppData() {
         };
         currentPlan = syncedPlan;
         try { applyUiPrefsFromServer(data); } catch (_) {}
+        __planSyncAt = Date.now();
 
         // localStorage `solfai_user` и `*_plan` оставляем как кэш (для мгновенного UI до sync).
         // А `solfai_usage_*` / `solfai_img_*` для залогиненных НЕ пишем — БД это источник истины,
@@ -271,24 +272,42 @@ async function syncChatsFromServer() {
 /** Квота + чаты с сервера. С дедупом параллельных вызовов и throttle. */
 let __serverSyncInflight = null;
 let __serverSyncLastAt = 0;
+let __planSyncAt = 0;
+let __userSyncLastAt = 0;
 const SERVER_SYNC_MIN_INTERVAL_MS = 8000;
+const USER_SYNC_MIN_INTERVAL_MS = 1500;
+
+async function refreshPlanAndUsageFromServer() {
+    if (!currentUser?.id) return;
+    if (Date.now() - __planSyncAt < 800) return;
+    await syncAppData();
+}
 
 function scheduleServerSync(reason = '') {
     if (!currentUser?.id) return Promise.resolve();
     if (__serverSyncInflight) return __serverSyncInflight;
     const now = Date.now();
-    // focus/visibility могут сыпаться часто — не долбим БД чаще раза в 8 сек
-    if (reason !== 'initApp' && reason !== 'updateUIForUser' && (now - __serverSyncLastAt) < SERVER_SYNC_MIN_INTERVAL_MS) {
-        return Promise.resolve();
+    const forceFull = reason === 'initApp' || reason === 'updateUIForUser';
+    const wantUser = forceFull || reason === 'pageshow' || reason === 'visibility' || reason === 'focus';
+    const chatsDue = forceFull || (now - __serverSyncLastAt) >= SERVER_SYNC_MIN_INTERVAL_MS;
+    const userDue = wantUser && (now - __userSyncLastAt) >= USER_SYNC_MIN_INTERVAL_MS;
+
+    if (!forceFull && !chatsDue && !userDue) return Promise.resolve();
+
+    if (chatsDue || forceFull) {
+        __serverSyncLastAt = now;
+        __userSyncLastAt = now;
+        __serverSyncInflight = Promise.all([
+            syncAppData(),
+            syncChatsFromServer(),
+        ])
+            .catch(err => console.warn('[Solf-ai] scheduleServerSync failed:', reason, err))
+            .finally(() => { __serverSyncInflight = null; });
+        return __serverSyncInflight;
     }
-    __serverSyncLastAt = now;
-    __serverSyncInflight = Promise.all([
-        syncAppData(),
-        syncChatsFromServer(),
-    ])
-        .catch(err => console.warn('[Solf-ai] scheduleServerSync failed:', reason, err))
-        .finally(() => { __serverSyncInflight = null; });
-    return __serverSyncInflight;
+
+    __userSyncLastAt = now;
+    return syncAppData().catch(err => console.warn('[Solf-ai] plan sync failed:', reason, err));
 }
 
 const PLAN_LIMITS = {
@@ -2159,9 +2178,11 @@ function applyUsageFromServer(usage) {
     if (Number.isFinite(Number(usage.requests_window_start))) currentUser.requests_window_start = Number(usage.requests_window_start);
     if (Number.isFinite(Number(usage.images_window_start))) currentUser.images_window_start = Number(usage.images_window_start);
     if (Number.isFinite(Number(usage.quiz_window_start))) currentUser.quiz_window_start = Number(usage.quiz_window_start);
+    if (usage.plan_type && PLAN_LIMITS[usage.plan_type]) {
+        currentUser.plan_type = usage.plan_type;
+    }
     localStorage.setItem('solfai_user', JSON.stringify(currentUser));
-    updateRequestsCounter();
-    refreshImageAttachVisibility();
+    updatePlanDisplay();
     if (typeof updateQuizCounter === 'function') updateQuizCounter();
 }
 
@@ -3597,6 +3618,9 @@ async function generateResponse(query, imageData = null) {
     // #region agent log
     fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'E',location:'app.js:generateResponse:entry',message:'generate start',data:{qLen:String(query||'').length,hasImage:!!imageData,loggedIn:typeof isUserLoggedIn==='function'&&isUserLoggedIn(),remaining:typeof getRemainingRequests==='function'?getRemainingRequests():null,notation:!!(typeof notationModeEnabled!=='undefined'&&notationModeEnabled),alreadyGenerating:!!isGenerating,hasSession:!!(typeof getSolfSessionToken==='function'&&getSolfSessionToken())},timestamp:Date.now()})}).catch(()=>{});
     // #endregion
+    if (isUserLoggedIn()) {
+        await refreshPlanAndUsageFromServer();
+    }
     if (getRemainingRequests() <= 0) { showNoRequestsToast(); refreshSendButtonState(); return; }
     if (imageData && getRemainingImages() <= 0) { 
         refreshImageAttachVisibility();
@@ -3671,16 +3695,23 @@ async function generateResponse(query, imageData = null) {
         // #region agent log
         fetch('http://127.0.0.1:7330/ingest/df8b8d4a-1590-4c7a-ab85-eeb56909cacc',{method:'POST',headers:{'Content-Type':'application/json','X-Debug-Session-Id':'eb36ee'},body:JSON.stringify({sessionId:'eb36ee',runId:'pre-fix',hypothesisId:'B',location:'app.js:generateResponse:instant',message:'instant theory path',data:{textLen:String(instantReplyText).length,loggedIn:isUserLoggedIn()},timestamp:Date.now()})}).catch(()=>{});
         // #endregion
-        // Локально сразу −1, в БД — fire-and-forget (атомарный increment на сервере)
-        if (isUserLoggedIn()) {
-            useRequest();
-            if (imageData) useImage();
-            consumeUsageOnServer(usageType).catch(err => {
-                console.warn('[Solf-ai] background usage charge failed:', err);
-            });
-        } else {
-            useRequest();
-            if (imageData) useImage();
+        try {
+            if (isUserLoggedIn()) {
+                const charged = await consumeUsageOnServer(usageType);
+                if (!charged) {
+                    useRequest();
+                    if (imageData) useImage();
+                }
+            } else {
+                useRequest();
+                if (imageData) useImage();
+            }
+        } catch (limitErr) {
+            removeTypingIndicator(replyChatId);
+            resetGeneratingUi();
+            if (limitErr?.code === 'LIMIT_IMAGES') showImageLimitModal();
+            else showNoRequestsToast();
+            return;
         }
         await delayQuickReplyFeel();
         await deliverInstantAiReply(instantReplyText, replyChatId);
@@ -4181,11 +4212,11 @@ function proceedWithQuery(query, imageData) {
     if (isMobileLayout()) dismissMobileChatKeyboard();
 }
 
-function sendChatMessage() {
+let __sendInflight = false;
+async function sendChatMessage() {
     let query = chatInput.value.trim();
     const imageData = normalizeImagePayload(attachedFiles[0]?.data || null);
-    if (getRemainingRequests() <= 0) { showNoRequestsToast(); refreshSendButtonState(); return; }
-    if ((!query && !imageData) || isGenerating) return;
+    if ((!query && !imageData) || isGenerating || __sendInflight) return;
 
     const clamped = clampChatMessage(query);
     if (clamped.truncated) {
@@ -4202,7 +4233,20 @@ function sendChatMessage() {
 
     lastUserQuery = query;
     if (!currentUser) { pendingQuery = { query, imageData }; showLoginPrompt(); return; }
-    proceedWithQuery(query, imageData);
+
+    __sendInflight = true;
+    try {
+        if (isUserLoggedIn()) await refreshPlanAndUsageFromServer();
+        if (getRemainingRequests() <= 0) { showNoRequestsToast(); refreshSendButtonState(); return; }
+        if (imageData && getRemainingImages() <= 0) {
+            refreshImageAttachVisibility();
+            showImageLimitModal();
+            return;
+        }
+        proceedWithQuery(query, imageData);
+    } finally {
+        __sendInflight = false;
+    }
 }
 
 function updateUIForUser(options = {}) {
